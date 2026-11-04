@@ -70,6 +70,7 @@ const botToken = process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN || '';
 const webAppUrl = process.env.WEBAPP_URL || 'https://bot-1793823483-4147-exel.bothost.tech/';
 const ownerId = process.env.OWNER_TELEGRAM_ID || '';
 const managerId = process.env.MANAGER_CHAT_ID || '';
+const buildVersion = '943a806';
 const stamp = () => new Date().toISOString();
 const cleanTags = value => [...new Set((Array.isArray(value) ? value : String(value || '').split(',')).map(item => String(item).trim().replace(/^#/, '').slice(0, 32)).filter(Boolean))].slice(0, 12);
 function taskView(task) {
@@ -215,7 +216,7 @@ const selectTask = db.prepare('SELECT * FROM tasks WHERE id=?');
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, 'http://localhost');
-    if (req.method === 'GET' && url.pathname === '/health') return json(res, 200, { ok: true });
+    if (req.method === 'GET' && url.pathname === '/health') return json(res, 200, { ok: true, version: buildVersion });
     if (req.method === 'GET' && /^\/fonts\/[A-Za-z0-9._-]+$/.test(url.pathname)) {
       const filename = url.pathname.slice('/fonts/'.length);
       const allowed = new Set(['HelveticaNeue-Light-Cyr.woff2', 'HelveticaNeue-UltraLight-Cyr.woff2']);
