@@ -106,7 +106,12 @@ function verifyInitData(initData) {
 }
 function authenticate(req) {
   const initData = req.headers['x-telegram-init-data'];
-  if (initData) return verifyInitData(String(initData)) || { invalid: true };
+  if (initData) {
+    const verified = verifyInitData(String(initData));
+    if (verified) return verified;
+    // Fall through to Basic Auth so the owner can recover from a stale Telegram
+    // WebView session or a token that has not yet been rotated in BotHost.
+  }
   const auth = req.headers.authorization || '';
   const supplied = auth.startsWith('Basic ') ? Buffer.from(auth.slice(6), 'base64').toString() : '';
   if (process.env.APP_PASSWORD && supplied === `tasks:${process.env.APP_PASSWORD}`) return { role: 'owner', id: '' };
