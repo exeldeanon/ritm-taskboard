@@ -48,6 +48,16 @@ CREATE TABLE IF NOT EXISTS comments (
   body TEXT NOT NULL,
   created_at TEXT NOT NULL,
   FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS task_steps (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id INTEGER NOT NULL,
+  title TEXT NOT NULL,
+  done INTEGER NOT NULL DEFAULT 0,
+  position INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
 );`);
 
 function ensureColumn(table, column, definition) {
@@ -250,7 +260,7 @@ const server = http.createServer(async (req, res) => {
       const status = String(url.searchParams.get('status') || '').trim();
       const priority = String(url.searchParams.get('priority') || '').trim();
       const tag = String(url.searchParams.get('tag') || '').trim().replace(/^#/, '').toLowerCase();
-      const items = taskViews(db.prepare(`SELECT t.*,(SELECT message FROM events e WHERE e.task_id=t.id ORDER BY e.id DESC LIMIT 1) AS last_event FROM tasks t WHERE (?=1 OR t.archived=0) ORDER BY t.sort_order, CASE t.status WHEN 'Готово' THEN 1 ELSE 0 END, CASE t.priority WHEN 'Срочный' THEN 0 WHEN 'Высокий' THEN 1 WHEN 'Обычный' THEN 2 ELSE 3 END, CASE WHEN t.due_date='' THEN 1 ELSE 0 END,t.due_date,t.updated_at DESC`).all(includeArchived ? 1 : 0).filter(task => {
+      const items = taskViews(db.prepare(`SELECT t.*,(SELECT message FROM events e WHERE e.task_id=t.id ORDER BY e.id DESC LIMIT 1) AS last_event,(SELECT COUNT(*) FROM task_steps s WHERE s.task_id=t.id) AS step_count,(SELECT COUNT(*) FROM task_steps s WHERE s.task_id=t.id AND s.done=1) AS completed_step_count FROM tasks t WHERE (?=1 OR t.archived=0) ORDER BY t.sort_order, CASE t.status WHEN 'Готово' THEN 1 ELSE 0 END, CASE t.priority WHEN 'Срочный' THEN 0 WHEN 'Высокий' THEN 1 WHEN 'Обычный' THEN 2 ELSE 3 END, CASE WHEN t.due_date='' THEN 1 ELSE 0 END,t.due_date,t.updated_at DESC`).all(includeArchived ? 1 : 0).filter(task => {
         const tags = taskView(task).tags;
         const haystack = `${task.title} ${task.description} ${task.next_step} ${task.blocker} ${task.assignee} ${tags.join(' ')}`.toLowerCase();
         return (!query || haystack.includes(query)) && (!status || task.status === status) && (!priority || task.priority === priority) && (!tag || tags.some(item => item.toLowerCase() === tag));
@@ -272,6 +282,35 @@ const server = http.createServer(async (req, res) => {
       const result = db.prepare('INSERT INTO comments(task_id,author,body,created_at) VALUES(?,?,?,?)').run(taskId, author, text.slice(0, 4000), stamp());
       logEvent(taskId, `Комментарий: ${text.slice(0, 90)}`);
       return json(res, 201, db.prepare('SELECT * FROM comments WHERE id=?').get(Number(result.lastInsertRowid)));
+    }
+    if (req.method === 'GET' && /^\/api\/tasks\/\d+\/steps$/.test(url.pathname)) {
+      const taskId = Number(url.pathname.split('/')[3]);
+      return json(res, 200, db.prepare('SELECT * FROM task_steps WHERE task_id=? ORDER BY position,id').all(taskId));
+    }
+    if (req.method === 'POST' && /^\/api\/tasks\/\d+\/steps$/.test(url.pathname)) {
+      const taskId = Number(url.pathname.split('/')[3]);
+      const patch = await body(req); const title = String(patch.title || '').trim();
+      if (!title) return json(res, 400, { error: 'Название шага не может быть пустым' });
+      const now = stamp(); const position = Number(db.prepare('SELECT COALESCE(MAX(position),-1)+1 AS next FROM task_steps WHERE task_id=?').get(taskId).next);
+      const result = db.prepare('INSERT INTO task_steps(task_id,title,done,position,created_at,updated_at) VALUES(?,?,?,?,?,?)').run(taskId, title.slice(0, 240), 0, position, now, now);
+      logEvent(taskId, `Добавлен шаг: ${title.slice(0, 90)}`);
+      return json(res, 201, db.prepare('SELECT * FROM task_steps WHERE id=?').get(Number(result.lastInsertRowid)));
+    }
+    if (req.method === 'PATCH' && /^\/api\/steps\/\d+$/.test(url.pathname)) {
+      const id = Number(url.pathname.split('/').at(-1)); const old = db.prepare('SELECT * FROM task_steps WHERE id=?').get(id);
+      if (!old) return json(res, 404, { error: 'Шаг не найден' });
+      const patch = await body(req); const title = patch.title === undefined ? old.title : String(patch.title).trim();
+      const done = patch.done === undefined ? old.done : (patch.done ? 1 : 0); const now = stamp();
+      db.prepare('UPDATE task_steps SET title=?,done=?,position=?,updated_at=? WHERE id=?').run(title.slice(0, 240), done, Number(patch.position ?? old.position), now, id);
+      logEvent(old.task_id, `${done ? 'Выполнен' : 'Открыт'} шаг: ${title.slice(0, 90)}`);
+      const task = selectTask.get(old.task_id); const delivered = await notify(task, done ? 'Шаг выполнен' : 'Шаг снова открыт');
+      return json(res, 200, { ...db.prepare('SELECT * FROM task_steps WHERE id=?').get(id), notification: delivered });
+    }
+    if (req.method === 'DELETE' && /^\/api\/steps\/\d+$/.test(url.pathname)) {
+      const id = Number(url.pathname.split('/').at(-1)); const old = db.prepare('SELECT * FROM task_steps WHERE id=?').get(id);
+      if (!old) return json(res, 404, { error: 'Шаг не найден' });
+      db.prepare('DELETE FROM task_steps WHERE id=?').run(id); logEvent(old.task_id, `Удалён шаг: ${old.title.slice(0, 90)}`);
+      return json(res, 200, { ok: true });
     }
     if ((req.method === 'POST' && url.pathname === '/api/tasks') || (req.method === 'PATCH' && /^\/api\/tasks\/\d+$/.test(url.pathname))) {
       const patch = await body(req); const isNew = req.method === 'POST';
