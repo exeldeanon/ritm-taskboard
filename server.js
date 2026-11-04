@@ -158,6 +158,14 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, 'http://localhost');
     if (req.method === 'GET' && url.pathname === '/health') return json(res, 200, { ok: true });
+    if (req.method === 'GET' && /^\/fonts\/[A-Za-z0-9._-]+$/.test(url.pathname)) {
+      const filename = url.pathname.slice('/fonts/'.length);
+      const allowed = new Set(['HelveticaNeue-Light-Cyr.woff2', 'HelveticaNeue-UltraLight-Cyr.woff2']);
+      if (!allowed.has(filename)) return json(res, 404, { error: 'Не найдено' });
+      const font = await readFile(join(root, 'fonts', filename));
+      res.writeHead(200, { 'content-type': 'font/woff2', 'cache-control': 'public, max-age=31536000, immutable' });
+      return res.end(font);
+    }
     if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html')) {
       const html = await readFile(join(root, 'index.html')); res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); return res.end(html);
     }
