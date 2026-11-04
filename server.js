@@ -40,7 +40,29 @@ CREATE TABLE IF NOT EXISTS events (
   message TEXT NOT NULL,
   created_at TEXT NOT NULL,
   FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS comments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id INTEGER NOT NULL,
+  author TEXT NOT NULL DEFAULT '',
+  body TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
 );`);
+
+function ensureColumn(table, column, definition) {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all();
+  if (!columns.some(item => item.name === column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+}
+ensureColumn('tasks', 'tags', "TEXT NOT NULL DEFAULT '[]'");
+ensureColumn('tasks', 'assignee', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('tasks', 'reminder_at', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('tasks', 'repeat_rule', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('tasks', 'archived', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('tasks', 'completed_at', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('tasks', 'parent_id', 'INTEGER');
+ensureColumn('tasks', 'sort_order', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('tasks', 'reminder_sent_at', "TEXT NOT NULL DEFAULT ''");
 
 const statuses = ['Входящие', 'Запланировано', 'В работе', 'Жду ответа', 'Готово'];
 const priorities = ['Низкий', 'Обычный', 'Высокий', 'Срочный'];
@@ -49,6 +71,14 @@ const webAppUrl = process.env.WEBAPP_URL || 'https://bot-1793823483-4147-exel.bo
 const ownerId = process.env.OWNER_TELEGRAM_ID || '';
 const managerId = process.env.MANAGER_CHAT_ID || '';
 const stamp = () => new Date().toISOString();
+const cleanTags = value => [...new Set((Array.isArray(value) ? value : String(value || '').split(',')).map(item => String(item).trim().replace(/^#/, '').slice(0, 32)).filter(Boolean))].slice(0, 12);
+function taskView(task) {
+  if (!task) return task;
+  let tags = [];
+  try { tags = JSON.parse(task.tags || '[]'); } catch { tags = cleanTags(task.tags); }
+  return { ...task, tags };
+}
+const taskViews = tasks => tasks.map(taskView);
 const json = (res, status, value) => { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(value)); };
 function verifyInitData(initData) {
   if (!botToken || !initData || initData.length > 8192) return null;
@@ -90,13 +120,24 @@ async function notify(task, action) {
   const due = task.due_date ? `\nСрок: ${task.due_date}` : '';
   const next = task.next_step ? `\nСледующий шаг: ${task.next_step}` : '';
   const block = task.blocker ? `\nБлокер: ${task.blocker}` : '';
-  const text = `📌 ${action}\n${task.title}\nСтатус: ${task.status} · Приоритет: ${task.priority}${due}${next}${block}`;
+  const assignee = task.assignee ? `\nОтветственный: ${task.assignee}` : '';
+  const tags = cleanTags(task.tags).length ? `\nТеги: ${cleanTags(task.tags).map(tag => `#${tag}`).join(' ')}` : '';
+  const text = `📌 ${action}\n${task.title}\nСтатус: ${task.status} · Приоритет: ${task.priority}${assignee}${tags}${due}${next}${block}`;
   try {
     const r = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ chat_id: chat, text })
     });
     return r.ok;
   } catch { return false; }
+}
+async function sendDueReminders() {
+  if (!botToken || !managerId) return;
+  const now = stamp();
+  const dueTasks = db.prepare(`SELECT * FROM tasks WHERE archived=0 AND status!='Готово' AND reminder_at!='' AND reminder_at<=? AND reminder_sent_at='' ORDER BY reminder_at LIMIT 20`).all(now);
+  for (const task of dueTasks) {
+    const delivered = await notify(task, 'Напоминание');
+    if (delivered) db.prepare('UPDATE tasks SET reminder_sent_at=?,updated_at=? WHERE id=?').run(now, now, task.id);
+  }
 }
 async function telegramCall(method, payload, timeout = 15000) {
   if (!botToken) throw new Error('Bot token is not configured');
@@ -122,6 +163,11 @@ async function handleTelegramUpdate(update) {
     await telegramCall('sendMessage', { chat_id: message.chat.id, text: `Ваш Telegram ID: ${message.from.id}` });
   } else if (command === '/help') {
     await telegramCall('sendMessage', { chat_id: message.chat.id, text: 'Команды:\n/start — открыть мини-приложение\n/id — показать ваш Telegram ID' });
+  } else if (command === '/today') {
+    const today = new Date().toISOString().slice(0, 10);
+    const dueTasks = taskViews(db.prepare(`SELECT * FROM tasks WHERE archived=0 AND status!='Готово' AND due_date=? ORDER BY priority DESC, updated_at DESC`).all(today));
+    const text = dueTasks.length ? `Задачи на сегодня:\n\n${dueTasks.map(task => `• ${task.title} — ${task.status}`).join('\n')}` : 'На сегодня задач нет.';
+    await telegramCall('sendMessage', { chat_id: message.chat.id, text });
   }
 }
 async function startTelegramBot() {
@@ -130,7 +176,8 @@ async function startTelegramBot() {
     await telegramCall('setMyCommands', { commands: [
       { command: 'start', description: 'Открыть Ритм' },
       { command: 'id', description: 'Показать мой Telegram ID' },
-      { command: 'help', description: 'Помощь' }
+      { command: 'help', description: 'Помощь' },
+      { command: 'today', description: 'Задачи на сегодня' }
     ] });
     await telegramCall('setChatMenuButton', { menu_button: { type: 'web_app', text: 'Открыть Ритм', web_app: { url: webAppUrl } } });
     console.log('Telegram Mini App menu button configured.');
@@ -177,14 +224,37 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="Progress Desk", charset="UTF-8"', 'content-type': 'application/json; charset=utf-8' });
         return res.end(JSON.stringify({ error: 'Введите пароль доски.' }));
       }
-      if (principal.role !== 'owner' && req.method !== 'GET') return json(res, 403, { error: 'Руководитель может просматривать задачи, но изменять их может только владелец.' });
+      const isCommentRequest = /\/comments$/.test(url.pathname);
+      if (principal.role !== 'owner' && req.method !== 'GET' && !isCommentRequest) return json(res, 403, { error: 'Руководитель может просматривать задачи и оставлять комментарии, но изменять свойства может только владелец.' });
     }
     if (req.method === 'GET' && url.pathname === '/api/tasks') {
-      const items = db.prepare(`SELECT t.*,(SELECT message FROM events e WHERE e.task_id=t.id ORDER BY e.id DESC LIMIT 1) AS last_event FROM tasks t ORDER BY CASE t.status WHEN 'Готово' THEN 1 ELSE 0 END, CASE t.priority WHEN 'Срочный' THEN 0 WHEN 'Высокий' THEN 1 WHEN 'Обычный' THEN 2 ELSE 3 END, CASE WHEN t.due_date='' THEN 1 ELSE 0 END,t.due_date,t.updated_at DESC`).all();
+      const includeArchived = url.searchParams.get('archived') === '1';
+      const query = String(url.searchParams.get('q') || '').trim().toLowerCase();
+      const status = String(url.searchParams.get('status') || '').trim();
+      const priority = String(url.searchParams.get('priority') || '').trim();
+      const tag = String(url.searchParams.get('tag') || '').trim().replace(/^#/, '').toLowerCase();
+      const items = taskViews(db.prepare(`SELECT t.*,(SELECT message FROM events e WHERE e.task_id=t.id ORDER BY e.id DESC LIMIT 1) AS last_event FROM tasks t WHERE (?=1 OR t.archived=0) ORDER BY t.sort_order, CASE t.status WHEN 'Готово' THEN 1 ELSE 0 END, CASE t.priority WHEN 'Срочный' THEN 0 WHEN 'Высокий' THEN 1 WHEN 'Обычный' THEN 2 ELSE 3 END, CASE WHEN t.due_date='' THEN 1 ELSE 0 END,t.due_date,t.updated_at DESC`).all(includeArchived ? 1 : 0).filter(task => {
+        const tags = taskView(task).tags;
+        const haystack = `${task.title} ${task.description} ${task.next_step} ${task.blocker} ${task.assignee} ${tags.join(' ')}`.toLowerCase();
+        return (!query || haystack.includes(query)) && (!status || task.status === status) && (!priority || task.priority === priority) && (!tag || tags.some(item => item.toLowerCase() === tag));
+      }));
       return json(res, 200, items);
     }
     if (req.method === 'GET' && url.pathname === '/api/events') {
       return json(res, 200, db.prepare(`SELECT e.*,t.title FROM events e JOIN tasks t ON t.id=e.task_id ORDER BY e.id DESC LIMIT 30`).all());
+    }
+    if (req.method === 'GET' && /^\/api\/tasks\/\d+\/comments$/.test(url.pathname)) {
+      const taskId = Number(url.pathname.split('/')[3]);
+      return json(res, 200, db.prepare('SELECT * FROM comments WHERE task_id=? ORDER BY id ASC').all(taskId));
+    }
+    if (req.method === 'POST' && /^\/api\/tasks\/\d+\/comments$/.test(url.pathname)) {
+      const taskId = Number(url.pathname.split('/')[3]);
+      const patch = await body(req); const text = String(patch.body || '').trim();
+      if (!text) return json(res, 400, { error: 'Комментарий не может быть пустым' });
+      const author = String(patch.author || principal.user?.first_name || (principal.role === 'manager' ? 'Руководитель' : 'Владелец')).trim().slice(0, 80);
+      const result = db.prepare('INSERT INTO comments(task_id,author,body,created_at) VALUES(?,?,?,?)').run(taskId, author, text.slice(0, 4000), stamp());
+      logEvent(taskId, `Комментарий: ${text.slice(0, 90)}`);
+      return json(res, 201, db.prepare('SELECT * FROM comments WHERE id=?').get(Number(result.lastInsertRowid)));
     }
     if ((req.method === 'POST' && url.pathname === '/api/tasks') || (req.method === 'PATCH' && /^\/api\/tasks\/\d+$/.test(url.pathname))) {
       const patch = await body(req); const isNew = req.method === 'POST';
@@ -195,19 +265,29 @@ const server = http.createServer(async (req, res) => {
       if (!title) return json(res, 400, { error: 'Укажите название задачи' });
       const status = statuses.includes(patch.status) ? patch.status : (old?.status || 'Входящие');
       const priority = priorities.includes(patch.priority) ? patch.priority : (old?.priority || 'Обычный');
-      const values = [title, String(patch.description ?? old?.description ?? ''), status, priority, String(patch.due_date ?? old?.due_date ?? ''), String(patch.next_step ?? old?.next_step ?? ''), String(patch.blocker ?? old?.blocker ?? ''), stamp()];
+      const tags = cleanTags(patch.tags ?? old?.tags);
+      const assignee = String(patch.assignee ?? old?.assignee ?? '').trim().slice(0, 120);
+      const dueDate = String(patch.due_date ?? old?.due_date ?? '').slice(0, 32);
+      const reminderAt = String(patch.reminder_at ?? old?.reminder_at ?? '').slice(0, 40);
+      const repeatRule = String(patch.repeat_rule ?? old?.repeat_rule ?? '').slice(0, 40);
+      const archived = patch.archived === undefined ? Number(old?.archived || 0) : (patch.archived ? 1 : 0);
+      const parentId = patch.parent_id === undefined ? (old?.parent_id || null) : (patch.parent_id ? Number(patch.parent_id) : null);
+      const completedAt = status === 'Готово' ? (old?.completed_at || stamp()) : '';
+      const reminderSentAt = reminderAt !== String(old?.reminder_at || '') ? '' : String(old?.reminder_sent_at || '');
+      const updatedAt = stamp();
+      const values = [title, String(patch.description ?? old?.description ?? ''), status, priority, dueDate, String(patch.next_step ?? old?.next_step ?? ''), String(patch.blocker ?? old?.blocker ?? ''), JSON.stringify(tags), assignee, reminderAt, repeatRule, archived, completedAt, parentId, Number(patch.sort_order ?? old?.sort_order ?? 0), reminderSentAt, updatedAt];
       if (isNew) {
-        const result = db.prepare('INSERT INTO tasks(title,description,status,priority,due_date,next_step,blocker,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)').run(...values.slice(0, 7), stamp(), values[7]);
+        const result = db.prepare('INSERT INTO tasks(title,description,status,priority,due_date,next_step,blocker,tags,assignee,reminder_at,repeat_rule,archived,completed_at,parent_id,sort_order,reminder_sent_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(...values.slice(0, 16), stamp(), updatedAt);
         const task = selectTask.get(Number(result.lastInsertRowid)); logEvent(task.id, 'Задача создана');
-        const delivered = await notify(task, 'Новая задача'); return json(res, 201, { ...task, notification: delivered });
+        const delivered = await notify(task, 'Новая задача'); return json(res, 201, { ...taskView(task), notification: delivered });
       }
-      db.prepare('UPDATE tasks SET title=?,description=?,status=?,priority=?,due_date=?,next_step=?,blocker=?,updated_at=? WHERE id=?').run(...values, id);
+      db.prepare('UPDATE tasks SET title=?,description=?,status=?,priority=?,due_date=?,next_step=?,blocker=?,tags=?,assignee=?,reminder_at=?,repeat_rule=?,archived=?,completed_at=?,parent_id=?,sort_order=?,reminder_sent_at=?,updated_at=? WHERE id=?').run(...values, id);
       const task = selectTask.get(id);
       const changes = [];
-      for (const field of ['title','description','status','priority','due_date','next_step','blocker']) if (String(old[field] ?? '') !== String(task[field] ?? '')) changes.push(field);
-      if (changes.length) logEvent(id, `Обновлено: ${changes.map(x => ({title:'название',description:'заметки',status:'статус',priority:'приоритет',due_date:'срок',next_step:'следующий шаг',blocker:'блокер'})[x]).join(', ')}`);
+      for (const field of ['title','description','status','priority','due_date','next_step','blocker','tags','assignee','reminder_at','repeat_rule','archived','parent_id']) if (String(old[field] ?? '') !== String(task[field] ?? '')) changes.push(field);
+      if (changes.length) logEvent(id, `Обновлено: ${changes.map(x => ({title:'название',description:'заметки',status:'статус',priority:'приоритет',due_date:'срок',next_step:'следующий шаг',blocker:'блокер',tags:'теги',assignee:'ответственный',reminder_at:'напоминание',repeat_rule:'повтор',archived:'архив',parent_id:'связь'})[x]).join(', ')}`);
       const delivered = changes.length ? await notify(task, 'Обновление задачи') : false;
-      return json(res, 200, { ...task, notification: delivered });
+      return json(res, 200, { ...taskView(task), notification: delivered });
     }
     if (req.method === 'DELETE' && /^\/api\/tasks\/\d+$/.test(url.pathname)) {
       const id = Number(url.pathname.split('/').at(-1));
@@ -224,4 +304,6 @@ const server = http.createServer(async (req, res) => {
 });
 const port = Number(process.env.PORT || 4173);
 server.listen(port, '0.0.0.0', () => console.log(`Progress Desk: http://localhost:${port}`));
+void sendDueReminders();
+setInterval(() => { void sendDueReminders(); }, 60_000);
 void startTelegramBot();
