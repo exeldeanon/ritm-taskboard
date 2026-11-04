@@ -73,6 +73,8 @@ ensureColumn('tasks', 'completed_at', "TEXT NOT NULL DEFAULT ''");
 ensureColumn('tasks', 'parent_id', 'INTEGER');
 ensureColumn('tasks', 'sort_order', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('tasks', 'reminder_sent_at', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('tasks', 'scheduled_at', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('tasks', 'depends_on_id', 'INTEGER');
 
 const statuses = ['Входящие', 'Запланировано', 'В работе', 'Жду ответа', 'Готово'];
 const priorities = ['Низкий', 'Обычный', 'Высокий', 'Срочный'];
@@ -139,7 +141,9 @@ async function notify(task, action) {
   const block = task.blocker ? `\nБлокер: ${task.blocker}` : '';
   const assignee = task.assignee ? `\nОтветственный: ${task.assignee}` : '';
   const tags = cleanTags(task.tags).length ? `\nТеги: ${cleanTags(task.tags).map(tag => `#${tag}`).join(' ')}` : '';
-  const text = `📌 ${action}\n${task.title}\nСтатус: ${task.status} · Приоритет: ${task.priority}${assignee}${tags}${due}${next}${block}`;
+  const scheduled = task.scheduled_at ? `\nЗапланировано: ${task.scheduled_at}` : '';
+  const dependency = task.depends_on_title ? `\nПосле: ${task.depends_on_title}` : '';
+  const text = `📌 ${action}\n${task.title}\nСтатус: ${task.status} · Приоритет: ${task.priority}${assignee}${tags}${scheduled}${dependency}${due}${next}${block}`;
   try {
     const r = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ chat_id: chat, text })
@@ -260,7 +264,7 @@ const server = http.createServer(async (req, res) => {
       const status = String(url.searchParams.get('status') || '').trim();
       const priority = String(url.searchParams.get('priority') || '').trim();
       const tag = String(url.searchParams.get('tag') || '').trim().replace(/^#/, '').toLowerCase();
-      const items = taskViews(db.prepare(`SELECT t.*,(SELECT message FROM events e WHERE e.task_id=t.id ORDER BY e.id DESC LIMIT 1) AS last_event,(SELECT COUNT(*) FROM task_steps s WHERE s.task_id=t.id) AS step_count,(SELECT COUNT(*) FROM task_steps s WHERE s.task_id=t.id AND s.done=1) AS completed_step_count FROM tasks t WHERE (?=1 OR t.archived=0) ORDER BY t.sort_order, CASE t.status WHEN 'Готово' THEN 1 ELSE 0 END, CASE t.priority WHEN 'Срочный' THEN 0 WHEN 'Высокий' THEN 1 WHEN 'Обычный' THEN 2 ELSE 3 END, CASE WHEN t.due_date='' THEN 1 ELSE 0 END,t.due_date,t.updated_at DESC`).all(includeArchived ? 1 : 0).filter(task => {
+      const items = taskViews(db.prepare(`SELECT t.*,(SELECT message FROM events e WHERE e.task_id=t.id ORDER BY e.id DESC LIMIT 1) AS last_event,(SELECT COUNT(*) FROM task_steps s WHERE s.task_id=t.id) AS step_count,(SELECT COUNT(*) FROM task_steps s WHERE s.task_id=t.id AND s.done=1) AS completed_step_count,(SELECT title FROM tasks dep WHERE dep.id=t.depends_on_id) AS depends_on_title,(SELECT status FROM tasks dep WHERE dep.id=t.depends_on_id) AS depends_on_status FROM tasks t WHERE (?=1 OR t.archived=0) ORDER BY t.sort_order, CASE t.status WHEN 'Готово' THEN 1 ELSE 0 END, CASE t.priority WHEN 'Срочный' THEN 0 WHEN 'Высокий' THEN 1 WHEN 'Обычный' THEN 2 ELSE 3 END, CASE WHEN t.due_date='' THEN 1 ELSE 0 END,t.due_date,t.updated_at DESC`).all(includeArchived ? 1 : 0).filter(task => {
         const tags = taskView(task).tags;
         const haystack = `${task.title} ${task.description} ${task.next_step} ${task.blocker} ${task.assignee} ${tags.join(' ')}`.toLowerCase();
         return (!query || haystack.includes(query)) && (!status || task.status === status) && (!priority || task.priority === priority) && (!tag || tags.some(item => item.toLowerCase() === tag));
@@ -326,22 +330,25 @@ const server = http.createServer(async (req, res) => {
       const dueDate = String(patch.due_date ?? old?.due_date ?? '').slice(0, 32);
       const reminderAt = String(patch.reminder_at ?? old?.reminder_at ?? '').slice(0, 40);
       const repeatRule = String(patch.repeat_rule ?? old?.repeat_rule ?? '').slice(0, 40);
+      const scheduledAt = String(patch.scheduled_at ?? old?.scheduled_at ?? '').slice(0, 40);
+      const dependsOnId = patch.depends_on_id === undefined ? (old?.depends_on_id || null) : (patch.depends_on_id ? Number(patch.depends_on_id) : null);
+      if (dependsOnId && ((!isNew && dependsOnId === id) || !db.prepare('SELECT id FROM tasks WHERE id=?').get(dependsOnId))) return json(res, 400, { error: 'Выберите существующую другую задачу для зависимости' });
       const archived = patch.archived === undefined ? Number(old?.archived || 0) : (patch.archived ? 1 : 0);
       const parentId = patch.parent_id === undefined ? (old?.parent_id || null) : (patch.parent_id ? Number(patch.parent_id) : null);
       const completedAt = status === 'Готово' ? (old?.completed_at || stamp()) : '';
       const reminderSentAt = reminderAt !== String(old?.reminder_at || '') ? '' : String(old?.reminder_sent_at || '');
       const updatedAt = stamp();
-      const values = [title, String(patch.description ?? old?.description ?? ''), status, priority, dueDate, String(patch.next_step ?? old?.next_step ?? ''), String(patch.blocker ?? old?.blocker ?? ''), JSON.stringify(tags), assignee, reminderAt, repeatRule, archived, completedAt, parentId, Number(patch.sort_order ?? old?.sort_order ?? 0), reminderSentAt, updatedAt];
+      const values = [title, String(patch.description ?? old?.description ?? ''), status, priority, dueDate, String(patch.next_step ?? old?.next_step ?? ''), String(patch.blocker ?? old?.blocker ?? ''), JSON.stringify(tags), assignee, reminderAt, repeatRule, scheduledAt, dependsOnId, archived, completedAt, parentId, Number(patch.sort_order ?? old?.sort_order ?? 0), reminderSentAt, updatedAt];
       if (isNew) {
-        const result = db.prepare('INSERT INTO tasks(title,description,status,priority,due_date,next_step,blocker,tags,assignee,reminder_at,repeat_rule,archived,completed_at,parent_id,sort_order,reminder_sent_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(...values.slice(0, 16), stamp(), updatedAt);
+        const result = db.prepare('INSERT INTO tasks(title,description,status,priority,due_date,next_step,blocker,tags,assignee,reminder_at,repeat_rule,scheduled_at,depends_on_id,archived,completed_at,parent_id,sort_order,reminder_sent_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(...values.slice(0, 18), stamp(), updatedAt);
         const task = selectTask.get(Number(result.lastInsertRowid)); logEvent(task.id, 'Задача создана');
         const delivered = await notify(task, 'Новая задача'); return json(res, 201, { ...taskView(task), notification: delivered });
       }
-      db.prepare('UPDATE tasks SET title=?,description=?,status=?,priority=?,due_date=?,next_step=?,blocker=?,tags=?,assignee=?,reminder_at=?,repeat_rule=?,archived=?,completed_at=?,parent_id=?,sort_order=?,reminder_sent_at=?,updated_at=? WHERE id=?').run(...values, id);
+      db.prepare('UPDATE tasks SET title=?,description=?,status=?,priority=?,due_date=?,next_step=?,blocker=?,tags=?,assignee=?,reminder_at=?,repeat_rule=?,scheduled_at=?,depends_on_id=?,archived=?,completed_at=?,parent_id=?,sort_order=?,reminder_sent_at=?,updated_at=? WHERE id=?').run(...values, id);
       const task = selectTask.get(id);
       const changes = [];
-      for (const field of ['title','description','status','priority','due_date','next_step','blocker','tags','assignee','reminder_at','repeat_rule','archived','parent_id']) if (String(old[field] ?? '') !== String(task[field] ?? '')) changes.push(field);
-      if (changes.length) logEvent(id, `Обновлено: ${changes.map(x => ({title:'название',description:'заметки',status:'статус',priority:'приоритет',due_date:'срок',next_step:'следующий шаг',blocker:'блокер',tags:'теги',assignee:'ответственный',reminder_at:'напоминание',repeat_rule:'повтор',archived:'архив',parent_id:'связь'})[x]).join(', ')}`);
+      for (const field of ['title','description','status','priority','due_date','next_step','blocker','tags','assignee','reminder_at','repeat_rule','scheduled_at','depends_on_id','archived','parent_id']) if (String(old[field] ?? '') !== String(task[field] ?? '')) changes.push(field);
+      if (changes.length) logEvent(id, `Обновлено: ${changes.map(x => ({title:'название',description:'заметки',status:'статус',priority:'приоритет',due_date:'срок',next_step:'следующий шаг',blocker:'блокер',tags:'теги',assignee:'ответственный',reminder_at:'напоминание',repeat_rule:'повтор',scheduled_at:'планирование',depends_on_id:'зависимость',archived:'архив',parent_id:'связь'})[x]).join(', ')}`);
       const delivered = changes.length ? await notify(task, 'Обновление задачи') : false;
       return json(res, 200, { ...taskView(task), notification: delivered });
     }
