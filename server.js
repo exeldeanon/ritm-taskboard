@@ -136,7 +136,17 @@ async function sendDueReminders() {
   const dueTasks = db.prepare(`SELECT * FROM tasks WHERE archived=0 AND status!='Готово' AND reminder_at!='' AND reminder_at<=? AND reminder_sent_at='' ORDER BY reminder_at LIMIT 20`).all(now);
   for (const task of dueTasks) {
     const delivered = await notify(task, 'Напоминание');
-    if (delivered) db.prepare('UPDATE tasks SET reminder_sent_at=?,updated_at=? WHERE id=?').run(now, now, task.id);
+    if (delivered) {
+      let nextReminder = '';
+      if (task.repeat_rule && task.reminder_at) {
+        const next = new Date(task.reminder_at);
+        if (task.repeat_rule === 'daily') next.setDate(next.getDate() + 1);
+        if (task.repeat_rule === 'weekly') next.setDate(next.getDate() + 7);
+        if (task.repeat_rule === 'monthly') next.setMonth(next.getMonth() + 1);
+        nextReminder = next.toISOString();
+      }
+      db.prepare('UPDATE tasks SET reminder_sent_at=?,reminder_at=?,updated_at=? WHERE id=?').run(nextReminder ? '' : now, nextReminder, now, task.id);
+    }
   }
 }
 async function telegramCall(method, payload, timeout = 15000) {
