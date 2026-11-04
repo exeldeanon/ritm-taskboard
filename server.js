@@ -91,7 +91,8 @@ function verifyInitData(initData) {
     const now = Math.floor(Date.now() / 1000);
     if (authDate > now + 60 || now - authDate > 86400) return null;
     const checkString = [...params.entries()].filter(([key]) => key !== 'hash' && key !== 'signature').sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([key, value]) => `${key}=${value}`).join('\n');
-    const secret = createHmac('sha256', botToken).update('WebAppData').digest();
+    // Telegram derives the secret with WebAppData as the HMAC key and the bot token as data.
+    const secret = createHmac('sha256', 'WebAppData').update(botToken).digest();
     const expectedHash = createHmac('sha256', secret).update(checkString).digest();
     const actualHash = Buffer.from(receivedHash, 'hex');
     if (actualHash.length !== expectedHash.length || !timingSafeEqual(actualHash, expectedHash)) return null;
