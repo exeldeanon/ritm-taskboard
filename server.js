@@ -74,7 +74,7 @@ const server = http.createServer(async (req, res) => {
       const supplied = auth.startsWith('Basic ') ? Buffer.from(auth.slice(6), 'base64').toString() : '';
       const expected = `tasks:${process.env.APP_PASSWORD}`;
       if (supplied !== expected) {
-        res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="Ритм — задачи", charset="UTF-8"', 'content-type': 'text/plain; charset=utf-8' });
+        res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="Progress Desk", charset="UTF-8"', 'content-type': 'text/plain; charset=utf-8' });
         return res.end('Для просмотра задач нужен пароль.');
       }
     }
