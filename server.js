@@ -187,7 +187,7 @@ async function handleTelegramUpdate(update) {
   if (command === '/start') {
     await telegramCall('sendMessage', {
       chat_id: message.chat.id,
-      text: 'Ритм — ваши задачи и прогресс. Откройте доску кнопкой ниже.',
+      text: 'alwtasks — ваши задачи и прогресс. Откройте доску кнопкой ниже.',
       reply_markup: { inline_keyboard: [[{ text: 'Открыть Ритм', web_app: { url: webAppUrl } }]] }
     });
   } else if (command === '/id') {
@@ -243,6 +243,11 @@ const server = http.createServer(async (req, res) => {
       const font = await readFile(join(root, 'fonts', filename));
       res.writeHead(200, { 'content-type': 'font/woff2', 'cache-control': 'public, max-age=31536000, immutable' });
       return res.end(font);
+    }
+    if (req.method === 'GET' && url.pathname === '/assets/alwtasks-logo.png') {
+      const logo = await readFile(join(root, 'assets', 'alwtasks-logo.png'));
+      res.writeHead(200, { 'content-type': 'image/png', 'cache-control': 'public, max-age=31536000, immutable' });
+      return res.end(logo);
     }
     if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html')) {
       const html = await readFile(join(root, 'index.html')); res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); return res.end(html);
