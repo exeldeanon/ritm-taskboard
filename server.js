@@ -94,7 +94,7 @@ const ownerId = process.env.OWNER_TELEGRAM_ID || '';
 const managerId = process.env.MANAGER_CHAT_ID || '';
 const ownerPassword = process.env.OWNER_PASSWORD || process.env.APP_PASSWORD || '';
 const managerPassword = process.env.MANAGER_PASSWORD || process.env.APP_PASSWORD || '';
-const buildVersion = 'notify-confirm-20261105';
+const buildVersion = 'board-steps-20261105';
 const launchUrl = (() => { try { const parsed = new URL(webAppUrl); parsed.searchParams.set('v', buildVersion); return parsed.toString(); } catch { return webAppUrl; } })();
 const stamp = () => new Date().toISOString();
 const cleanTags = value => [...new Set((Array.isArray(value) ? value : String(value || '').split(',')).map(item => String(item).trim().replace(/^#/, '').slice(0, 32)).filter(Boolean))].slice(0, 12);
@@ -102,7 +102,10 @@ function taskView(task) {
   if (!task) return task;
   let tags = [];
   try { tags = JSON.parse(task.tags || '[]'); } catch { tags = cleanTags(task.tags); }
-  return { ...task, tags };
+  let steps = [];
+  try { steps = JSON.parse(task.steps_json || '[]'); } catch {}
+  const { steps_json, ...rest } = task;
+  return { ...rest, tags, steps };
 }
 const taskViews = tasks => tasks.map(taskView);
 const json = (res, status, value) => { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(value)); };
@@ -303,7 +306,7 @@ const server = http.createServer(async (req, res) => {
       const status = String(url.searchParams.get('status') || '').trim();
       const priority = String(url.searchParams.get('priority') || '').trim();
       const tag = String(url.searchParams.get('tag') || '').trim().replace(/^#/, '').toLowerCase();
-      const items = taskViews(db.prepare(`SELECT t.*,(SELECT message FROM events e WHERE e.task_id=t.id ORDER BY e.id DESC LIMIT 1) AS last_event,(SELECT COUNT(*) FROM task_steps s WHERE s.task_id=t.id) AS step_count,(SELECT COUNT(*) FROM task_steps s WHERE s.task_id=t.id AND s.done=1) AS completed_step_count,(SELECT title FROM tasks dep WHERE dep.id=t.depends_on_id) AS depends_on_title,(SELECT status FROM tasks dep WHERE dep.id=t.depends_on_id) AS depends_on_status FROM tasks t WHERE (?=1 OR t.archived=0) ORDER BY t.sort_order, CASE t.status WHEN 'Готово' THEN 1 ELSE 0 END, CASE t.priority WHEN 'Срочный' THEN 0 WHEN 'Высокий' THEN 1 WHEN 'Обычный' THEN 2 ELSE 3 END, CASE WHEN t.due_date='' THEN 1 ELSE 0 END,t.due_date,t.updated_at DESC`).all(includeArchived ? 1 : 0).filter(task => {
+      const items = taskViews(db.prepare(`SELECT t.*,(SELECT message FROM events e WHERE e.task_id=t.id ORDER BY e.id DESC LIMIT 1) AS last_event,(SELECT COUNT(*) FROM task_steps s WHERE s.task_id=t.id) AS step_count,(SELECT COUNT(*) FROM task_steps s WHERE s.task_id=t.id AND s.done=1) AS completed_step_count,(SELECT COALESCE(json_group_array(json_object('id',s.id,'title',s.title,'done',s.done,'step_status',s.step_status,'position',s.position)), '[]') FROM (SELECT id,title,done,step_status,position FROM task_steps WHERE task_id=t.id ORDER BY position,id) s) AS steps_json,(SELECT title FROM tasks dep WHERE dep.id=t.depends_on_id) AS depends_on_title,(SELECT status FROM tasks dep WHERE dep.id=t.depends_on_id) AS depends_on_status FROM tasks t WHERE (?=1 OR t.archived=0) ORDER BY t.sort_order, CASE t.status WHEN 'Готово' THEN 1 ELSE 0 END, CASE t.priority WHEN 'Срочный' THEN 0 WHEN 'Высокий' THEN 1 WHEN 'Обычный' THEN 2 ELSE 3 END, CASE WHEN t.due_date='' THEN 1 ELSE 0 END,t.due_date,t.updated_at DESC`).all(includeArchived ? 1 : 0).filter(task => {
         const tags = taskView(task).tags;
         const haystack = `${task.title} ${task.description} ${task.next_step} ${task.blocker} ${task.assignee} ${tags.join(' ')}`.toLowerCase();
         return (!query || haystack.includes(query)) && (!status || task.status === status) && (!priority || task.priority === priority) && (!tag || tags.some(item => item.toLowerCase() === tag));
