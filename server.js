@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   task_id INTEGER NOT NULL,
   message TEXT NOT NULL,
+  actor TEXT NOT NULL DEFAULT 'Система',
   created_at TEXT NOT NULL,
   FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
 );
@@ -53,6 +54,10 @@ CREATE TABLE IF NOT EXISTS task_steps (
   task_id INTEGER NOT NULL,
   title TEXT NOT NULL,
   done INTEGER NOT NULL DEFAULT 0,
+  due_date TEXT NOT NULL DEFAULT '',
+  assignee TEXT NOT NULL DEFAULT '',
+  note TEXT NOT NULL DEFAULT '',
+  url TEXT NOT NULL DEFAULT '',
   position INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
@@ -67,6 +72,10 @@ CREATE TABLE IF NOT EXISTS telegram_pending (
   telegram_id TEXT PRIMARY KEY,
   requested_role TEXT NOT NULL,
   created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS app_settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL DEFAULT ''
 );`);
 
 function ensureColumn(table, column, definition) {
@@ -85,6 +94,11 @@ ensureColumn('tasks', 'reminder_sent_at', "TEXT NOT NULL DEFAULT ''");
 ensureColumn('tasks', 'scheduled_at', "TEXT NOT NULL DEFAULT ''");
 ensureColumn('tasks', 'depends_on_id', 'INTEGER');
 ensureColumn('task_steps', 'step_status', "TEXT NOT NULL DEFAULT 'Следующий'");
+ensureColumn('task_steps', 'due_date', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('task_steps', 'assignee', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('task_steps', 'note', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('task_steps', 'url', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('events', 'actor', "TEXT NOT NULL DEFAULT 'Система'");
 
 const statuses = ['Входящие', 'Запланировано', 'В работе', 'Жду ответа', 'Готово'];
 const priorities = ['Низкий', 'Обычный', 'Высокий', 'Срочный'];
@@ -94,7 +108,8 @@ const ownerId = process.env.OWNER_TELEGRAM_ID || '';
 const managerId = process.env.MANAGER_CHAT_ID || '';
 const ownerPassword = process.env.OWNER_PASSWORD || process.env.APP_PASSWORD || '';
 const managerPassword = process.env.MANAGER_PASSWORD || process.env.APP_PASSWORD || '';
-const buildVersion = 'board-steps-20261105';
+const buildVersion = 'all-features-20261105';
+const digestHour = Math.max(0, Math.min(23, Number(process.env.DAILY_DIGEST_HOUR || 18)));
 const launchUrl = (() => { try { const parsed = new URL(webAppUrl); parsed.searchParams.set('v', buildVersion); return parsed.toString(); } catch { return webAppUrl; } })();
 const stamp = () => new Date().toISOString();
 const cleanTags = value => [...new Set((Array.isArray(value) ? value : String(value || '').split(',')).map(item => String(item).trim().replace(/^#/, '').slice(0, 32)).filter(Boolean))].slice(0, 12);
@@ -108,6 +123,11 @@ function taskView(task) {
   return { ...rest, tags, steps };
 }
 const taskViews = tasks => tasks.map(taskView);
+const taskTemplates = [
+  { id: 'website-launch', title: 'Запуск сайта', description: 'Подготовить и выпустить новый сайт.', next_step: 'Собрать требования', tags: ['сайт'], steps: ['Собрать требования', 'Подготовить прототип', 'Согласовать дизайн', 'Разработать страницу', 'Проверить и опубликовать'] },
+  { id: 'lead-processing', title: 'Обработка лида', description: 'Провести лид от первого контакта до результата.', next_step: 'Связаться с клиентом', tags: ['лид'], steps: ['Связаться с клиентом', 'Уточнить потребность', 'Подготовить предложение', 'Зафиксировать результат'] },
+  { id: 'weekly-report', title: 'Еженедельный отчёт', description: 'Собрать результаты недели и подготовить отчёт.', next_step: 'Собрать цифры', tags: ['отчёт'], steps: ['Собрать цифры', 'Проверить данные', 'Сформировать выводы', 'Отправить отчёт'] }
+];
 const json = (res, status, value) => { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(value)); };
 function authenticate(req) {
   const id = String(req.headers['x-telegram-user-id'] || '').trim();
@@ -141,14 +161,15 @@ async function notify(task, action, context = {}) {
   const scheduled = task.scheduled_at ? `\nЗапланировано: ${task.scheduled_at}` : '';
   const dependency = task.depends_on_title ? `\nПосле задачи: ${task.depends_on_title}${task.depends_on_status ? ` (${task.depends_on_status})` : ''}` : '';
   const progress = steps.length ? `\nПрогресс шагов: ${steps.filter(step => step.step_status === 'Готово' || step.done).length}/${steps.length}` : '\nШаги: не добавлены';
-  const stepLines = steps.length ? `\n\nШаги задачи:\n${steps.map((step, index) => `${step.step_status === 'Готово' || step.done ? '✅' : step.step_status === 'Проблема' ? '⚠️' : step.step_status === 'Жду ответа' ? '↗️' : step.step_status === 'В работе' ? '⏳' : '▫️'} ${index + 1}. ${step.title} — ${step.step_status || (step.done ? 'Готово' : 'Следующий')}`).join('\n')}` : '';
-  const changedStep = context.step ? `\n\nШаг задачи ${Number.isFinite(Number(context.step.position)) ? Number(context.step.position) + 1 : '—'}: «${context.step.title}»\nСтатус шага: ${context.step.step_status || context.step.status || 'Следующий'}${context.previousStatus ? `\nБыло: ${context.previousStatus}` : ''}` : '';
+  const stepLines = steps.length ? `\n\nШаги задачи:\n${steps.map((step, index) => `${step.step_status === 'Готово' || step.done ? '✅' : step.step_status === 'Проблема' ? '⚠️' : step.step_status === 'Жду ответа' ? '↗️' : step.step_status === 'В работе' ? '⏳' : '▫️'} ${index + 1}. ${step.title} — ${step.step_status || (step.done ? 'Готово' : 'Следующий')}${step.due_date ? ` · срок ${step.due_date}` : ''}${step.assignee ? ` · ${step.assignee}` : ''}${step.note ? `\n   ${step.note}` : ''}`).join('\n')}` : '';
+  const changedStep = context.step ? `\n\nШаг задачи ${Number.isFinite(Number(context.step.position)) ? Number(context.step.position) + 1 : '—'}: «${context.step.title}»\nСтатус шага: ${context.step.step_status || context.step.status || 'Следующий'}${context.previousStatus ? `\nБыло: ${context.previousStatus}` : ''}${context.step.due_date ? `\nСрок шага: ${context.step.due_date}` : ''}${context.step.assignee ? `\nОтветственный за шаг: ${context.step.assignee}` : ''}${context.step.note ? `\nКомментарий к шагу: ${context.step.note}` : ''}` : '';
   const comment = context.comment ? `\n\nКомментарий от ${context.comment.author}:\n${context.comment.body}` : '';
   const changes = context.changes?.length ? `\n\nЧто изменилось:\n${context.changes.map(item => `• ${notificationFieldLabels[item.field] || item.field}: ${notificationValue(item.before)} → ${notificationValue(item.after)}`).join('\n')}` : '';
-  const text = `📌 ${action}\nЗадача #${task.id}: ${task.title}\nСтатус задачи: ${task.status}\nПриоритет: ${task.priority}${assignee}${tags}${scheduled}${dependency}${due}${next}${block}${progress}${changes}${changedStep}${comment}${stepLines}`.slice(0, 3900);
+  const statusSync = context.taskStatusChange ? `\n\nАвтостатус по шагам: ${context.taskStatusChange.before} → ${context.taskStatusChange.after}` : '';
+  const text = `📌 ${action}\nЗадача #${task.id}: ${task.title}\nСтатус задачи: ${task.status}\nПриоритет: ${task.priority}${assignee}${tags}${scheduled}${dependency}${due}${next}${block}${progress}${statusSync}${changes}${changedStep}${comment}${stepLines}`.slice(0, 3900);
   try {
     const r = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ chat_id: chat, text })
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ chat_id: chat, text, reply_markup: { inline_keyboard: [[{ text: 'Открыть задачу', web_app: { url: `${launchUrl}#task=${task.id}` } }]] } })
     });
     return r.ok;
   } catch { return false; }
@@ -229,6 +250,10 @@ async function handleTelegramUpdate(update) {
   } else if (command === '/help') {
     if (!approved) return telegramCall('sendMessage', { chat_id: message.chat.id, text: 'Сначала отправьте /start и пароль доступа.' });
     await telegramCall('sendMessage', { chat_id: message.chat.id, text: 'Команды:\n/start — открыть мини-приложение\n/id — показать ваш Telegram ID' });
+  } else if (command === '/report') {
+    if (!approved) return telegramCall('sendMessage', { chat_id: message.chat.id, text: 'Сначала отправьте /start и пароль доступа.' });
+    const delivered = await sendDailyDigest(true, String(message.chat.id));
+    if (!delivered) await telegramCall('sendMessage', { chat_id: message.chat.id, text: 'Не удалось сформировать отчёт. Проверьте настройки Telegram-бота.' });
   } else if (command === '/today') {
     if (!approved) return telegramCall('sendMessage', { chat_id: message.chat.id, text: 'Сначала отправьте /start и пароль доступа.' });
     const today = new Date().toISOString().slice(0, 10);
@@ -244,6 +269,7 @@ async function startTelegramBot() {
       { command: 'start', description: 'Открыть alwtasks' },
       { command: 'id', description: 'Показать мой Telegram ID' },
       { command: 'help', description: 'Помощь' },
+      { command: 'report', description: 'Полный отчёт по задачам' },
       { command: 'today', description: 'Задачи на сегодня' },
       { command: 'logout', description: 'Сменить роль' }
     ] });
@@ -267,8 +293,48 @@ async function startTelegramBot() {
     }
   }
 }
-function logEvent(id, message) { db.prepare('INSERT INTO events(task_id,message,created_at) VALUES(?,?,?)').run(id, message, stamp()); }
+function actorLabel(principal) { return principal?.role === 'manager' ? 'Начальство' : principal?.role === 'owner' ? 'Менеджер' : 'Система'; }
+function logEvent(id, message, actor = 'Система') { db.prepare('INSERT INTO events(task_id,message,actor,created_at) VALUES(?,?,?,?)').run(id, message, actor, stamp()); }
 const selectTask = db.prepare('SELECT t.*,(SELECT title FROM tasks dep WHERE dep.id=t.depends_on_id) AS depends_on_title,(SELECT status FROM tasks dep WHERE dep.id=t.depends_on_id) AS depends_on_status FROM tasks t WHERE t.id=?');
+function syncTaskStatus(taskId) {
+  const task = selectTask.get(taskId);
+  if (!task) return null;
+  const steps = db.prepare('SELECT * FROM task_steps WHERE task_id=? ORDER BY position,id').all(taskId);
+  if (!steps.length) return null;
+  const allDone = steps.every(step => step.step_status === 'Готово' || step.done);
+  const hasProblem = steps.some(step => step.step_status === 'Проблема');
+  const hasWaiting = steps.some(step => step.step_status === 'Жду ответа');
+  const hasWork = steps.some(step => step.step_status === 'В работе');
+  const nextStatus = allDone ? 'Готово' : hasProblem || hasWaiting ? 'Жду ответа' : hasWork ? 'В работе' : 'Запланировано';
+  if (nextStatus === task.status) return null;
+  const now = stamp();
+  db.prepare('UPDATE tasks SET status=?,completed_at=?,updated_at=? WHERE id=?').run(nextStatus, nextStatus === 'Готово' ? (task.completed_at || now) : '', now, taskId);
+  logEvent(taskId, `Автостатус по шагам: ${task.status} → ${nextStatus}`);
+  return { before: task.status, after: nextStatus };
+}
+function moscowNow() {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Moscow', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', hourCycle: 'h23' }).formatToParts(new Date()).map(item => [item.type, item.value]));
+  return { ...parts, date: `${parts.year}-${parts.month}-${parts.day}`, hour: Number(parts.hour) };
+}
+function appSetting(key) { return db.prepare('SELECT value FROM app_settings WHERE key=?').get(key)?.value || ''; }
+function setAppSetting(key, value) { db.prepare('INSERT INTO app_settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, String(value)); }
+async function sendDailyDigest(force = false, targetChat = managerId) {
+  if (!botToken || !targetChat) return false;
+  const now = moscowNow();
+  if (!force && (now.hour < digestHour || appSetting('daily_digest_date') === now.date)) return false;
+  const active = db.prepare("SELECT * FROM tasks WHERE archived=0 AND status!='Готово' ORDER BY CASE WHEN due_date='' THEN 1 ELSE 0 END,due_date,priority DESC,updated_at DESC").all();
+  const overdue = active.filter(task => task.due_date && task.due_date < now.date);
+  const today = active.filter(task => task.due_date === now.date);
+  const waiting = active.filter(task => task.status === 'Жду ответа' || db.prepare("SELECT 1 FROM task_steps WHERE task_id=? AND step_status IN ('Жду ответа','Проблема') LIMIT 1").get(task.id));
+  const completed = db.prepare("SELECT * FROM tasks WHERE completed_at LIKE ? ORDER BY completed_at DESC LIMIT 20").all(`${now.date}%`);
+  const list = (items, empty = 'нет') => items.length ? items.slice(0, 12).map(task => `• #${task.id} ${task.title}${task.assignee ? ` · ${task.assignee}` : ''}${task.due_date ? ` · до ${task.due_date}` : ''}`).join('\n') : empty;
+  const text = `📊 Ежедневный контроль alwtasks\n${now.date}\n\n🔴 Просрочено (${overdue.length})\n${list(overdue)}\n\n🟡 На сегодня (${today.length})\n${list(today)}\n\n↗️ Ждут ответа или решения (${waiting.length})\n${list(waiting)}\n\n✅ Завершено сегодня (${completed.length})\n${list(completed)}`.slice(0, 3900);
+  try {
+    await telegramCall('sendMessage', { chat_id: targetChat, text, reply_markup: { inline_keyboard: [[{ text: 'Открыть контроль', web_app: { url: `${launchUrl}#control` } }]] } });
+    if (String(targetChat) === String(managerId)) setAppSetting('daily_digest_date', now.date);
+    return true;
+  } catch { return false; }
+}
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, 'http://localhost');
@@ -306,12 +372,30 @@ const server = http.createServer(async (req, res) => {
       const status = String(url.searchParams.get('status') || '').trim();
       const priority = String(url.searchParams.get('priority') || '').trim();
       const tag = String(url.searchParams.get('tag') || '').trim().replace(/^#/, '').toLowerCase();
-      const items = taskViews(db.prepare(`SELECT t.*,(SELECT message FROM events e WHERE e.task_id=t.id ORDER BY e.id DESC LIMIT 1) AS last_event,(SELECT COUNT(*) FROM task_steps s WHERE s.task_id=t.id) AS step_count,(SELECT COUNT(*) FROM task_steps s WHERE s.task_id=t.id AND s.done=1) AS completed_step_count,(SELECT COALESCE(json_group_array(json_object('id',s.id,'title',s.title,'done',s.done,'step_status',s.step_status,'position',s.position)), '[]') FROM (SELECT id,title,done,step_status,position FROM task_steps WHERE task_id=t.id ORDER BY position,id) s) AS steps_json,(SELECT title FROM tasks dep WHERE dep.id=t.depends_on_id) AS depends_on_title,(SELECT status FROM tasks dep WHERE dep.id=t.depends_on_id) AS depends_on_status FROM tasks t WHERE (?=1 OR t.archived=0) ORDER BY t.sort_order, CASE t.status WHEN 'Готово' THEN 1 ELSE 0 END, CASE t.priority WHEN 'Срочный' THEN 0 WHEN 'Высокий' THEN 1 WHEN 'Обычный' THEN 2 ELSE 3 END, CASE WHEN t.due_date='' THEN 1 ELSE 0 END,t.due_date,t.updated_at DESC`).all(includeArchived ? 1 : 0).filter(task => {
+      const items = taskViews(db.prepare(`SELECT t.*,(SELECT message FROM events e WHERE e.task_id=t.id ORDER BY e.id DESC LIMIT 1) AS last_event,(SELECT COUNT(*) FROM task_steps s WHERE s.task_id=t.id) AS step_count,(SELECT COUNT(*) FROM task_steps s WHERE s.task_id=t.id AND s.done=1) AS completed_step_count,(SELECT COALESCE(json_group_array(json_object('id',s.id,'title',s.title,'done',s.done,'step_status',s.step_status,'due_date',s.due_date,'assignee',s.assignee,'note',s.note,'url',s.url,'position',s.position)), '[]') FROM (SELECT id,title,done,step_status,due_date,assignee,note,url,position FROM task_steps WHERE task_id=t.id ORDER BY position,id) s) AS steps_json,(SELECT title FROM tasks dep WHERE dep.id=t.depends_on_id) AS depends_on_title,(SELECT status FROM tasks dep WHERE dep.id=t.depends_on_id) AS depends_on_status FROM tasks t WHERE (?=1 OR t.archived=0) ORDER BY t.sort_order, CASE t.status WHEN 'Готово' THEN 1 ELSE 0 END, CASE t.priority WHEN 'Срочный' THEN 0 WHEN 'Высокий' THEN 1 WHEN 'Обычный' THEN 2 ELSE 3 END, CASE WHEN t.due_date='' THEN 1 ELSE 0 END,t.due_date,t.updated_at DESC`).all(includeArchived ? 1 : 0).filter(task => {
         const tags = taskView(task).tags;
         const haystack = `${task.title} ${task.description} ${task.next_step} ${task.blocker} ${task.assignee} ${tags.join(' ')}`.toLowerCase();
         return (!query || haystack.includes(query)) && (!status || task.status === status) && (!priority || task.priority === priority) && (!tag || tags.some(item => item.toLowerCase() === tag));
       }));
       return json(res, 200, items);
+    }
+    if (req.method === 'GET' && url.pathname === '/api/templates') return json(res, 200, taskTemplates);
+    if (req.method === 'GET' && url.pathname === '/api/export') {
+      const exportTasks = db.prepare('SELECT * FROM tasks ORDER BY id').all();
+      const exportSteps = db.prepare('SELECT * FROM task_steps ORDER BY task_id,position,id').all();
+      const exportComments = db.prepare('SELECT * FROM comments ORDER BY task_id,id').all();
+      const exportEvents = db.prepare('SELECT * FROM events ORDER BY task_id,id').all();
+      if (url.searchParams.get('format') === 'csv') {
+        const csv = value => `"${String(value ?? '').replace(/"/g, '""')}"`;
+        const rows = [['Тип','ID','Задача','Название','Статус','Приоритет','Срок','Ответственный','Шаг/комментарий','Статус шага','Комментарий','Ссылка','Изменил','Дата']];
+        for (const task of exportTasks) rows.push(['Задача', task.id, task.title, task.title, task.status, task.priority, task.due_date, task.assignee, '', '', task.description, '', '', task.updated_at]);
+        for (const step of exportSteps) rows.push(['Шаг', step.id, step.task_id, step.title, '', '', step.due_date, step.assignee, step.title, step.step_status, step.note, step.url, '', step.updated_at]);
+        for (const comment of exportComments) rows.push(['Комментарий', comment.id, comment.task_id, '', '', '', '', comment.author, '', '', comment.body, '', comment.author, comment.created_at]);
+        const output = rows.map(row => row.map(csv).join(',')).join('\r\n');
+        res.writeHead(200, { 'content-type': 'text/csv; charset=utf-8', 'content-disposition': 'attachment; filename="alwtasks-export.csv"' });
+        return res.end(`\uFEFF${output}`);
+      }
+      return json(res, 200, { exported_at: stamp(), tasks: exportTasks, steps: exportSteps, comments: exportComments, events: exportEvents });
     }
     if (req.method === 'GET' && url.pathname === '/api/events') {
       return json(res, 200, db.prepare(`SELECT e.*,t.title FROM events e JOIN tasks t ON t.id=e.task_id ORDER BY e.id DESC LIMIT 30`).all());
@@ -326,7 +410,7 @@ const server = http.createServer(async (req, res) => {
       if (!text) return json(res, 400, { error: 'Комментарий не может быть пустым' });
       const author = String(patch.author || principal.user?.first_name || (principal.role === 'manager' ? 'Руководитель' : 'Владелец')).trim().slice(0, 80);
       const result = db.prepare('INSERT INTO comments(task_id,author,body,created_at) VALUES(?,?,?,?)').run(taskId, author, text.slice(0, 4000), stamp());
-      logEvent(taskId, `Комментарий: ${text.slice(0, 90)}`);
+      logEvent(taskId, `Комментарий: ${text.slice(0, 90)}`, actorLabel(principal));
       const comment = db.prepare('SELECT * FROM comments WHERE id=?').get(Number(result.lastInsertRowid));
       const task = selectTask.get(taskId); const delivered = await notify(task, 'Новый комментарий', { comment });
       return json(res, 201, { ...comment, notification: delivered });
@@ -340,11 +424,16 @@ const server = http.createServer(async (req, res) => {
       const patch = await body(req); const title = String(patch.title || '').trim();
       if (!title) return json(res, 400, { error: 'Название шага не может быть пустым' });
       const stepStatus = ['Следующий','В работе','Жду ответа','Проблема','Готово'].includes(patch.step_status) ? patch.step_status : 'Следующий';
+      const dueDate = String(patch.due_date || '').slice(0, 32);
+      const assignee = String(patch.assignee || '').trim().slice(0, 120);
+      const note = String(patch.note || '').trim().slice(0, 1000);
+      const stepUrl = String(patch.url || '').trim().slice(0, 1000);
       const now = stamp(); const position = Number(db.prepare('SELECT COALESCE(MAX(position),-1)+1 AS next FROM task_steps WHERE task_id=?').get(taskId).next);
-      const result = db.prepare('INSERT INTO task_steps(task_id,title,done,step_status,position,created_at,updated_at) VALUES(?,?,?,?,?,?,?)').run(taskId, title.slice(0, 240), stepStatus === 'Готово' ? 1 : 0, stepStatus, position, now, now);
-      logEvent(taskId, `Добавлен шаг: ${title.slice(0, 90)}`);
+      const result = db.prepare('INSERT INTO task_steps(task_id,title,done,step_status,due_date,assignee,note,url,position,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)').run(taskId, title.slice(0, 240), stepStatus === 'Готово' ? 1 : 0, stepStatus, dueDate, assignee, note, stepUrl, position, now, now);
+      logEvent(taskId, `Добавлен шаг: ${title.slice(0, 90)}`, actorLabel(principal));
+      const statusChange = syncTaskStatus(taskId);
       const step = db.prepare('SELECT * FROM task_steps WHERE id=?').get(Number(result.lastInsertRowid));
-      const task = selectTask.get(taskId); const delivered = await notify(task, 'Добавлен новый шаг', { step });
+      const task = selectTask.get(taskId); const delivered = await notify(task, 'Добавлен новый шаг', { step, taskStatusChange: statusChange });
       return json(res, 201, { ...step, notification: delivered });
     }
     if (req.method === 'PATCH' && /^\/api\/steps\/\d+$/.test(url.pathname)) {
@@ -353,17 +442,23 @@ const server = http.createServer(async (req, res) => {
       const patch = await body(req); const title = patch.title === undefined ? old.title : String(patch.title).trim();
       const status = patch.step_status === undefined ? (patch.done === undefined ? (old.step_status || (old.done ? 'Готово' : 'Следующий')) : (patch.done ? 'Готово' : 'В работе')) : (['Следующий','В работе','Жду ответа','Проблема','Готово'].includes(patch.step_status) ? patch.step_status : 'Следующий');
       const done = status === 'Готово' ? 1 : 0; const now = stamp();
-      db.prepare('UPDATE task_steps SET title=?,done=?,step_status=?,position=?,updated_at=? WHERE id=?').run(title.slice(0, 240), done, status, Number(patch.position ?? old.position), now, id);
-      logEvent(old.task_id, `Шаг «${title.slice(0, 70)}»: ${status}`);
+      const dueDate = patch.due_date === undefined ? old.due_date : String(patch.due_date || '').slice(0, 32);
+      const assignee = patch.assignee === undefined ? old.assignee : String(patch.assignee || '').trim().slice(0, 120);
+      const note = patch.note === undefined ? old.note : String(patch.note || '').trim().slice(0, 1000);
+      const stepUrl = patch.url === undefined ? old.url : String(patch.url || '').trim().slice(0, 1000);
+      db.prepare('UPDATE task_steps SET title=?,done=?,step_status=?,due_date=?,assignee=?,note=?,url=?,position=?,updated_at=? WHERE id=?').run(title.slice(0, 240), done, status, dueDate, assignee, note, stepUrl, Number(patch.position ?? old.position), now, id);
+      logEvent(old.task_id, `Шаг «${title.slice(0, 70)}»: ${status}`, actorLabel(principal));
+      const statusChange = syncTaskStatus(old.task_id);
       const step = db.prepare('SELECT * FROM task_steps WHERE id=?').get(id);
-      const task = selectTask.get(old.task_id); const delivered = await notify(task, `Статус шага изменён: ${status}`, { step, previousStatus: old.step_status || (old.done ? 'Готово' : 'Следующий') });
+      const task = selectTask.get(old.task_id); const delivered = await notify(task, `Статус шага изменён: ${status}`, { step, previousStatus: old.step_status || (old.done ? 'Готово' : 'Следующий'), taskStatusChange: statusChange });
       return json(res, 200, { ...step, notification: delivered });
     }
     if (req.method === 'DELETE' && /^\/api\/steps\/\d+$/.test(url.pathname)) {
       const id = Number(url.pathname.split('/').at(-1)); const old = db.prepare('SELECT * FROM task_steps WHERE id=?').get(id);
       if (!old) return json(res, 404, { error: 'Шаг не найден' });
-      db.prepare('DELETE FROM task_steps WHERE id=?').run(id); logEvent(old.task_id, `Удалён шаг: ${old.title.slice(0, 90)}`);
-      const task = selectTask.get(old.task_id); const delivered = await notify(task, 'Шаг удалён', { step: old });
+      db.prepare('DELETE FROM task_steps WHERE id=?').run(id); logEvent(old.task_id, `Удалён шаг: ${old.title.slice(0, 90)}`, actorLabel(principal));
+      const statusChange = syncTaskStatus(old.task_id);
+      const task = selectTask.get(old.task_id); const delivered = await notify(task, 'Шаг удалён', { step: old, taskStatusChange: statusChange });
       return json(res, 200, { ok: true, notification: delivered });
     }
     if ((req.method === 'POST' && url.pathname === '/api/tasks') || (req.method === 'PATCH' && /^\/api\/tasks\/\d+$/.test(url.pathname))) {
@@ -391,22 +486,25 @@ const server = http.createServer(async (req, res) => {
       const values = [title, String(patch.description ?? old?.description ?? ''), status, priority, dueDate, String(patch.next_step ?? old?.next_step ?? ''), String(patch.blocker ?? old?.blocker ?? ''), JSON.stringify(tags), assignee, reminderAt, repeatRule, scheduledAt, dependsOnId, archived, completedAt, parentId, Number(patch.sort_order ?? old?.sort_order ?? 0), reminderSentAt, updatedAt];
       if (isNew) {
         const result = db.prepare('INSERT INTO tasks(title,description,status,priority,due_date,next_step,blocker,tags,assignee,reminder_at,repeat_rule,scheduled_at,depends_on_id,archived,completed_at,parent_id,sort_order,reminder_sent_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(...values.slice(0, 18), stamp(), updatedAt);
-        const task = selectTask.get(Number(result.lastInsertRowid)); logEvent(task.id, 'Задача создана');
+        const task = selectTask.get(Number(result.lastInsertRowid)); logEvent(task.id, 'Задача создана', actorLabel(principal));
         const delivered = await notify(task, 'Новая задача'); return json(res, 201, { ...taskView(task), notification: delivered });
       }
       db.prepare('UPDATE tasks SET title=?,description=?,status=?,priority=?,due_date=?,next_step=?,blocker=?,tags=?,assignee=?,reminder_at=?,repeat_rule=?,scheduled_at=?,depends_on_id=?,archived=?,completed_at=?,parent_id=?,sort_order=?,reminder_sent_at=?,updated_at=? WHERE id=?').run(...values, id);
       const task = selectTask.get(id);
       const changes = [];
       for (const field of ['title','description','status','priority','due_date','next_step','blocker','tags','assignee','reminder_at','repeat_rule','scheduled_at','depends_on_id','archived','parent_id']) if (String(old[field] ?? '') !== String(task[field] ?? '')) changes.push(field);
-      if (changes.length) logEvent(id, `Обновлено: ${changes.map(x => ({title:'название',description:'заметки',status:'статус',priority:'приоритет',due_date:'срок',next_step:'следующий шаг',blocker:'блокер',tags:'теги',assignee:'ответственный',reminder_at:'напоминание',repeat_rule:'повтор',scheduled_at:'планирование',depends_on_id:'зависимость',archived:'архив',parent_id:'связь'})[x]).join(', ')}`);
+      if (changes.length) logEvent(id, `Обновлено: ${changes.map(x => ({title:'название',description:'заметки',status:'статус',priority:'приоритет',due_date:'срок',next_step:'следующий шаг',blocker:'блокер',tags:'теги',assignee:'ответственный',reminder_at:'напоминание',repeat_rule:'повтор',scheduled_at:'планирование',depends_on_id:'зависимость',archived:'архив',parent_id:'связь'})[x]).join(', ')}`, actorLabel(principal));
       const changeDetails = changes.map(field => ({ field, before: old[field], after: task[field] }));
       const delivered = changes.length ? await notify(task, 'Обновление задачи', { changes: changeDetails }) : false;
       return json(res, 200, { ...taskView(task), notification: delivered });
     }
     if (req.method === 'DELETE' && /^\/api\/tasks\/\d+$/.test(url.pathname)) {
       const id = Number(url.pathname.split('/').at(-1));
+      const task = selectTask.get(id);
+      const delivered = task ? await notify(task, 'Задача удалена') : false;
       db.prepare('DELETE FROM events WHERE task_id=?').run(id); const result = db.prepare('DELETE FROM tasks WHERE id=?').run(id);
-      return json(res, result.changes ? 200 : 404, { ok: Boolean(result.changes) });
+      if (!result.changes) return json(res, 404, { error: 'Задача не найдена' });
+      return json(res, 200, { ok: true, notification: delivered });
     }
     if (req.method === 'GET' && url.pathname === '/api/config') return json(res, 200, {
       role: principal.role, canEdit: principal.role === 'owner',
@@ -421,4 +519,6 @@ const port = Number(process.env.PORT || 4173);
 server.listen(port, '0.0.0.0', () => console.log(`Progress Desk: http://localhost:${port}`));
 void sendDueReminders();
 setInterval(() => { void sendDueReminders(); }, 60_000);
+void sendDailyDigest();
+setInterval(() => { void sendDailyDigest(); }, 60_000);
 void startTelegramBot();
