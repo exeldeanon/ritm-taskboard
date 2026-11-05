@@ -62,6 +62,11 @@ CREATE TABLE IF NOT EXISTS telegram_users (
   telegram_id TEXT PRIMARY KEY,
   role TEXT NOT NULL DEFAULT 'manager',
   approved_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS telegram_pending (
+  telegram_id TEXT PRIMARY KEY,
+  requested_role TEXT NOT NULL,
+  created_at TEXT NOT NULL
 );`);
 
 function ensureColumn(table, column, definition) {
@@ -87,6 +92,8 @@ const botToken = process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN || '';
 const webAppUrl = process.env.WEBAPP_URL || 'https://bot-1793823483-4147-exel.bothost.tech/';
 const ownerId = process.env.OWNER_TELEGRAM_ID || '';
 const managerId = process.env.MANAGER_CHAT_ID || '';
+const ownerPassword = process.env.OWNER_PASSWORD || process.env.APP_PASSWORD || '';
+const managerPassword = process.env.MANAGER_PASSWORD || process.env.APP_PASSWORD || '';
 const buildVersion = '9ae1cc2';
 const stamp = () => new Date().toISOString();
 const cleanTags = value => [...new Set((Array.isArray(value) ? value : String(value || '').split(',')).map(item => String(item).trim().replace(/^#/, '').slice(0, 32)).filter(Boolean))].slice(0, 12);
@@ -164,9 +171,16 @@ async function handleTelegramUpdate(update) {
   const telegramId = String(message.from.id);
   const approved = db.prepare('SELECT * FROM telegram_users WHERE telegram_id=?').get(telegramId);
   const command = String(message.text || '').trim().split(/\s+/, 1)[0].split('@')[0];
+  const roleKeyboard = { keyboard: [[{ text: 'Начальство' }, { text: 'Менеджер' }]], resize_keyboard: true, one_time_keyboard: true };
+  if (command === '/logout') {
+    db.prepare('DELETE FROM telegram_users WHERE telegram_id=?').run(telegramId);
+    db.prepare('DELETE FROM telegram_pending WHERE telegram_id=?').run(telegramId);
+    await telegramCall('sendMessage', { chat_id: message.chat.id, text: 'Роль сброшена. Выберите, как войти в alwtasks.', reply_markup: roleKeyboard });
+    return;
+  }
   if (command === '/start') {
     if (!approved) {
-      await telegramCall('sendMessage', { chat_id: message.chat.id, text: 'Чтобы открыть alwtasks, отправьте пароль одним сообщением.' });
+      await telegramCall('sendMessage', { chat_id: message.chat.id, text: 'Выберите роль для входа в alwtasks.', reply_markup: roleKeyboard });
       return;
     }
     await telegramCall('sendMessage', {
@@ -175,12 +189,21 @@ async function handleTelegramUpdate(update) {
       reply_markup: { inline_keyboard: [[{ text: 'Открыть alwtasks', web_app: { url: webAppUrl } }]] }
     });
   } else if (!approved && message.text && !String(message.text).startsWith('/')) {
-    if (process.env.APP_PASSWORD && String(message.text).trim() === process.env.APP_PASSWORD) {
-      const role = ownerId ? (telegramId === ownerId ? 'owner' : 'manager') : 'owner';
-      db.prepare('INSERT INTO telegram_users(telegram_id,role,approved_at) VALUES(?,?,?) ON CONFLICT(telegram_id) DO UPDATE SET role=excluded.role,approved_at=excluded.approved_at').run(telegramId, role, stamp());
-      await telegramCall('sendMessage', { chat_id: message.chat.id, text: 'Готово. Доступ к alwtasks открыт.', reply_markup: { inline_keyboard: [[{ text: 'Открыть alwtasks', web_app: { url: webAppUrl } }]] } });
+    const text = String(message.text).trim();
+    if (text === 'Начальство' || text === 'Менеджер') {
+      const requestedRole = text === 'Начальство' ? 'manager' : 'owner';
+      db.prepare('INSERT INTO telegram_pending(telegram_id,requested_role,created_at) VALUES(?,?,?) ON CONFLICT(telegram_id) DO UPDATE SET requested_role=excluded.requested_role,created_at=excluded.created_at').run(telegramId, requestedRole, stamp());
+      await telegramCall('sendMessage', { chat_id: message.chat.id, text: text === 'Начальство' ? 'Введите пароль начальства.' : 'Введите пароль менеджера.', reply_markup: { remove_keyboard: true } });
+      return;
+    }
+    const pending = db.prepare('SELECT * FROM telegram_pending WHERE telegram_id=?').get(telegramId);
+    const expectedPassword = pending?.requested_role === 'owner' ? ownerPassword : pending?.requested_role === 'manager' ? managerPassword : '';
+    if (pending && expectedPassword && text === expectedPassword) {
+      db.prepare('INSERT INTO telegram_users(telegram_id,role,approved_at) VALUES(?,?,?) ON CONFLICT(telegram_id) DO UPDATE SET role=excluded.role,approved_at=excluded.approved_at').run(telegramId, pending.requested_role, stamp());
+      db.prepare('DELETE FROM telegram_pending WHERE telegram_id=?').run(telegramId);
+      await telegramCall('sendMessage', { chat_id: message.chat.id, text: `Готово. Вход выполнен как ${pending.requested_role === 'owner' ? 'менеджер' : 'начальство'}.`, reply_markup: { inline_keyboard: [[{ text: 'Открыть alwtasks', web_app: { url: webAppUrl } }]] } });
     } else {
-      await telegramCall('sendMessage', { chat_id: message.chat.id, text: 'Пароль не подошёл. Отправьте пароль ещё раз или /start.' });
+      await telegramCall('sendMessage', { chat_id: message.chat.id, text: 'Пароль не подошёл. Отправьте /start и выберите роль заново.' });
     }
     return;
   } else if (command === '/id') {
@@ -204,7 +227,8 @@ async function startTelegramBot() {
       { command: 'start', description: 'Открыть alwtasks' },
       { command: 'id', description: 'Показать мой Telegram ID' },
       { command: 'help', description: 'Помощь' },
-      { command: 'today', description: 'Задачи на сегодня' }
+      { command: 'today', description: 'Задачи на сегодня' },
+      { command: 'logout', description: 'Сменить роль' }
     ] });
     await telegramCall('setChatMenuButton', { menu_button: { type: 'web_app', text: 'Открыть alwtasks', web_app: { url: webAppUrl } } });
     console.log('Telegram Mini App menu button configured.');
@@ -362,6 +386,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'GET' && url.pathname === '/api/config') return json(res, 200, {
       role: principal.role, canEdit: principal.role === 'owner',
+      roleName: principal.role === 'owner' ? 'Менеджер' : 'Начальство',
       telegramEnabled: Boolean(botToken && managerId),
       accessReady: Boolean(ownerId && managerId)
     });
