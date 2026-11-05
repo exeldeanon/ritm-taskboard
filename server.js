@@ -132,7 +132,7 @@ const ownerId = process.env.OWNER_TELEGRAM_ID || '';
 const managerId = process.env.MANAGER_CHAT_ID || '';
 const ownerPassword = process.env.OWNER_PASSWORD || process.env.APP_PASSWORD || '';
 const managerPassword = process.env.MANAGER_PASSWORD || process.env.APP_PASSWORD || '';
-const buildVersion = 'custom-statuses-20261105';
+const buildVersion = 'auth-gate-mobile-20261105';
 const digestHour = Math.max(0, Math.min(23, Number(process.env.DAILY_DIGEST_HOUR || 18)));
 const launchUrl = (() => { try { const parsed = new URL(webAppUrl); parsed.searchParams.set('v', buildVersion); return parsed.toString(); } catch { return webAppUrl; } })();
 const stamp = () => new Date().toISOString();
@@ -405,7 +405,7 @@ const server = http.createServer(async (req, res) => {
       if (principal?.invalid) return json(res, 401, { error: 'Не удалось проверить сессию Telegram. Закройте и снова откройте мини-приложение.' });
       if (principal?.denied) return json(res, 403, { error: 'Доступ к доске не настроен для вашего Telegram-аккаунта.' });
       if (!principal) {
-        res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="Progress Desk", charset="UTF-8"', 'content-type': 'application/json; charset=utf-8' });
+        res.writeHead(401, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
         return res.end(JSON.stringify({ error: 'Введите пароль доски.' }));
       }
       const isCommentRequest = /\/comments$/.test(url.pathname);
