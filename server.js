@@ -171,9 +171,12 @@ function authenticate(req) {
   if (authorization.startsWith('Basic ')) {
     try {
       const decoded = Buffer.from(authorization.slice(6), 'base64').toString('utf8');
-      const password = decoded.slice(decoded.indexOf(':') + 1);
-      if (ownerPassword && password === ownerPassword) return { role: 'owner', user: { first_name: 'Менеджер' } };
-      if (managerPassword && password === managerPassword) return { role: 'manager', user: { first_name: 'Начальство' } };
+      const separator = decoded.indexOf(':');
+      const login = (separator >= 0 ? decoded.slice(0, separator) : '').trim().toLowerCase();
+      const password = decoded.slice(separator + 1);
+      const selectedRole = ['менеджер', 'manager', 'owner', 'владелец'].includes(login) ? 'owner' : ['начальство', 'boss', 'chief', 'руководитель'].includes(login) ? 'manager' : '';
+      if (ownerPassword && password === ownerPassword && (selectedRole === 'owner' || (!selectedRole && ownerPassword !== managerPassword))) return { role: 'owner', user: { first_name: 'Менеджер' } };
+      if (managerPassword && password === managerPassword && (selectedRole === 'manager' || (!selectedRole && managerPassword !== ownerPassword))) return { role: 'manager', user: { first_name: 'Начальство' } };
     } catch {}
   }
   return null;
