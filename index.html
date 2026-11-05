@@ -44,7 +44,7 @@
       <h1 id="authTitle">Вход в рабочий ритм</h1>
       <p>Авторизуйтесь, чтобы открыть задачи, шаги и прогресс команды.</p>
       <form class="auth-form" id="authForm" autocomplete="on">
-        <div class="auth-field"><label for="authLogin">Логин / роль</label><select id="authLogin" name="username" autocomplete="username"><option value="начальство">Начальство</option><option value="менеджер">Менеджер</option></select></div>
+        <div class="auth-field"><label for="authLogin">Логин / роль</label><select id="authLogin" name="username" autocomplete="username"><option value="boss">Начальство</option><option value="manager">Менеджер</option></select></div>
         <div class="auth-field"><label for="authPassword">Пароль</label><input id="authPassword" name="password" type="password" autocomplete="current-password" required></div>
         <label class="auth-remember"><input id="authRemember" type="checkbox" checked> Запомнить этот вход на этом устройстве</label>
         <div class="auth-error" id="authError" role="alert"></div>
@@ -92,7 +92,7 @@
     function requestHeaders(){const headers={'content-type':'application/json'};const id=tg?.initDataUnsafe?.user?.id;if(id)headers['X-Telegram-User-ID']=String(id);if(basicAuth)headers.Authorization=`Basic ${basicAuth}`;return headers}
     async function api(path,options={}){const r=await fetch(path,{...options,headers:{...requestHeaders(),...(options.headers||{})}});let data;try{data=await r.json()}catch{data={error:'Сервер вернул неожиданный ответ'}}if(!r.ok){const error=new Error(data.error||'Не удалось выполнить запрос');error.status=r.status;throw error}return data}
     function toast(text,warn=false){const t=$('toast');t.textContent=text;t.className=`toast show${warn?' warn':''}`;clearTimeout(toast.timer);toast.timer=setTimeout(()=>t.className='toast',3500)}
-    function confirmAction(text){if(tg?.showConfirm)return new Promise(resolve=>tg.showConfirm(text,resolve));return Promise.resolve(window.confirm(text))}
+    function confirmAction(text){if(tg?.initData&&tg.showConfirm)return new Promise(resolve=>tg.showConfirm(text,resolve));return Promise.resolve(window.confirm(text))}
     function isLate(task){return task.due_date&&!isDoneTask(task)&&task.due_date<dayKey()}
     function taskStepsDone(task){return Number(task.completed_step_count??(task.steps||[]).filter(step=>step.done||step.step_status==='Готово').length)}
     function filteredTasks(){const q=$('search').value.trim().toLowerCase(),today=dayKey(),week=weekKey();return tasks.filter(t=>{const tags=(t.tags||[]).join(' '),steps=(t.steps||[]).map(s=>`${s.title} ${s.note||''} ${s.assignee||''}`).join(' '),haystack=`${t.title} ${t.description} ${t.next_step} ${t.blocker} ${t.assignee} ${tags} ${steps}`.toLowerCase(),dueOk=!filterDue||(filterDue==='overdue'?isLate(t):filterDue==='today'?t.due_date===today:t.due_date>=today&&t.due_date<=week);return (filter==='Все'||(filter==='Активные'?!isDoneTask(t):t.status===filter))&&(!q||haystack.includes(q))&&(!filterAssignee||t.assignee===filterAssignee)&&(!filterPriority||t.priority===filterPriority)&&dueOk})}
