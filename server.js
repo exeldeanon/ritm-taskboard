@@ -94,7 +94,7 @@ const ownerId = process.env.OWNER_TELEGRAM_ID || '';
 const managerId = process.env.MANAGER_CHAT_ID || '';
 const ownerPassword = process.env.OWNER_PASSWORD || process.env.APP_PASSWORD || '';
 const managerPassword = process.env.MANAGER_PASSWORD || process.env.APP_PASSWORD || '';
-const buildVersion = '089f26d';
+const buildVersion = '17f701f';
 const launchUrl = (() => { try { const parsed = new URL(webAppUrl); parsed.searchParams.set('v', buildVersion); return parsed.toString(); } catch { return webAppUrl; } })();
 const stamp = () => new Date().toISOString();
 const cleanTags = value => [...new Set((Array.isArray(value) ? value : String(value || '').split(',')).map(item => String(item).trim().replace(/^#/, '').slice(0, 32)).filter(Boolean))].slice(0, 12);
