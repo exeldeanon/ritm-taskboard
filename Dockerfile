@@ -2,6 +2,8 @@ FROM node:22-bookworm-slim
 
 WORKDIR /usr/src/app
 COPY package.json server.js index.html ./
+COPY fonts ./fonts
+COPY assets ./assets
 
 RUN mkdir -p /app/data && chmod 777 /app/data
 ENV NODE_ENV=production
