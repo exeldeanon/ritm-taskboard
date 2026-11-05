@@ -95,6 +95,7 @@ const managerId = process.env.MANAGER_CHAT_ID || '';
 const ownerPassword = process.env.OWNER_PASSWORD || process.env.APP_PASSWORD || '';
 const managerPassword = process.env.MANAGER_PASSWORD || process.env.APP_PASSWORD || '';
 const buildVersion = '089f26d';
+const launchUrl = (() => { try { const parsed = new URL(webAppUrl); parsed.searchParams.set('v', buildVersion); return parsed.toString(); } catch { return webAppUrl; } })();
 const stamp = () => new Date().toISOString();
 const cleanTags = value => [...new Set((Array.isArray(value) ? value : String(value || '').split(',')).map(item => String(item).trim().replace(/^#/, '').slice(0, 32)).filter(Boolean))].slice(0, 12);
 function taskView(task) {
@@ -186,7 +187,7 @@ async function handleTelegramUpdate(update) {
     await telegramCall('sendMessage', {
       chat_id: message.chat.id,
       text: 'alwtasks — ваши задачи и прогресс. Откройте доску кнопкой ниже.',
-      reply_markup: { inline_keyboard: [[{ text: 'Открыть alwtasks', web_app: { url: webAppUrl } }]] }
+      reply_markup: { inline_keyboard: [[{ text: 'Открыть alwtasks', web_app: { url: launchUrl } }]] }
     });
   } else if (!approved && message.text && !String(message.text).startsWith('/')) {
     const text = String(message.text).trim();
@@ -201,7 +202,7 @@ async function handleTelegramUpdate(update) {
     if (pending && expectedPassword && text === expectedPassword) {
       db.prepare('INSERT INTO telegram_users(telegram_id,role,approved_at) VALUES(?,?,?) ON CONFLICT(telegram_id) DO UPDATE SET role=excluded.role,approved_at=excluded.approved_at').run(telegramId, pending.requested_role, stamp());
       db.prepare('DELETE FROM telegram_pending WHERE telegram_id=?').run(telegramId);
-      await telegramCall('sendMessage', { chat_id: message.chat.id, text: `Готово. Вход выполнен как ${pending.requested_role === 'owner' ? 'менеджер' : 'начальство'}.`, reply_markup: { inline_keyboard: [[{ text: 'Открыть alwtasks', web_app: { url: webAppUrl } }]] } });
+      await telegramCall('sendMessage', { chat_id: message.chat.id, text: `Готово. Вход выполнен как ${pending.requested_role === 'owner' ? 'менеджер' : 'начальство'}.`, reply_markup: { inline_keyboard: [[{ text: 'Открыть alwtasks', web_app: { url: launchUrl } }]] } });
     } else {
       await telegramCall('sendMessage', { chat_id: message.chat.id, text: 'Пароль не подошёл. Отправьте /start и выберите роль заново.' });
     }
@@ -230,7 +231,7 @@ async function startTelegramBot() {
       { command: 'today', description: 'Задачи на сегодня' },
       { command: 'logout', description: 'Сменить роль' }
     ] });
-    await telegramCall('setChatMenuButton', { menu_button: { type: 'web_app', text: 'Открыть alwtasks', web_app: { url: webAppUrl } } });
+    await telegramCall('setChatMenuButton', { menu_button: { type: 'web_app', text: 'Открыть alwtasks', web_app: { url: launchUrl } } });
     console.log('Telegram Mini App menu button configured.');
   } catch (error) { console.warn(`Could not configure Telegram Mini App menu button: ${error.message}`); }
   let offset = 0;
