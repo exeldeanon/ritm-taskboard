@@ -1,5 +1,4 @@
 import http from 'node:http';
-import { createHmac, timingSafeEqual } from 'node:crypto';
 import { readFile, mkdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -58,6 +57,11 @@ CREATE TABLE IF NOT EXISTS task_steps (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS telegram_users (
+  telegram_id TEXT PRIMARY KEY,
+  role TEXT NOT NULL DEFAULT 'manager',
+  approved_at TEXT NOT NULL
 );`);
 
 function ensureColumn(table, column, definition) {
@@ -75,6 +79,7 @@ ensureColumn('tasks', 'sort_order', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('tasks', 'reminder_sent_at', "TEXT NOT NULL DEFAULT ''");
 ensureColumn('tasks', 'scheduled_at', "TEXT NOT NULL DEFAULT ''");
 ensureColumn('tasks', 'depends_on_id', 'INTEGER');
+ensureColumn('task_steps', 'step_status', "TEXT NOT NULL DEFAULT 'Следующий'");
 
 const statuses = ['Входящие', 'Запланировано', 'В работе', 'Жду ответа', 'Готово'];
 const priorities = ['Низкий', 'Обычный', 'Высокий', 'Срочный'];
@@ -82,7 +87,7 @@ const botToken = process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN || '';
 const webAppUrl = process.env.WEBAPP_URL || 'https://bot-1793823483-4147-exel.bothost.tech/';
 const ownerId = process.env.OWNER_TELEGRAM_ID || '';
 const managerId = process.env.MANAGER_CHAT_ID || '';
-const buildVersion = '943a806';
+const buildVersion = '9ae1cc2';
 const stamp = () => new Date().toISOString();
 const cleanTags = value => [...new Set((Array.isArray(value) ? value : String(value || '').split(',')).map(item => String(item).trim().replace(/^#/, '').slice(0, 32)).filter(Boolean))].slice(0, 12);
 function taskView(task) {
@@ -93,40 +98,13 @@ function taskView(task) {
 }
 const taskViews = tasks => tasks.map(taskView);
 const json = (res, status, value) => { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(value)); };
-function verifyInitData(initData) {
-  if (!botToken || !initData || initData.length > 8192) return null;
-  try {
-    const params = new URLSearchParams(initData);
-    const receivedHash = params.get('hash');
-    const authDate = Number(params.get('auth_date'));
-    const rawUser = params.get('user');
-    if (!receivedHash || !/^[a-f0-9]{64}$/i.test(receivedHash) || !rawUser || !Number.isFinite(authDate)) return null;
-    const now = Math.floor(Date.now() / 1000);
-    if (authDate > now + 60 || now - authDate > 86400) return null;
-    const checkString = [...params.entries()].filter(([key]) => key !== 'hash' && key !== 'signature').sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([key, value]) => `${key}=${value}`).join('\n');
-    // Telegram derives the secret with WebAppData as the HMAC key and the bot token as data.
-    const secret = createHmac('sha256', 'WebAppData').update(botToken).digest();
-    const expectedHash = createHmac('sha256', secret).update(checkString).digest();
-    const actualHash = Buffer.from(receivedHash, 'hex');
-    if (actualHash.length !== expectedHash.length || !timingSafeEqual(actualHash, expectedHash)) return null;
-    const user = JSON.parse(rawUser);
-    const id = String(user.id || '');
-    const role = id && ownerId && id === ownerId ? 'owner' : id && managerId && id === managerId ? 'manager' : '';
-    if (!role) return { denied: true, user };
-    return { id, role, user };
-  } catch { return null; }
-}
 function authenticate(req) {
-  const initData = req.headers['x-telegram-init-data'];
-  if (initData) {
-    const verified = verifyInitData(String(initData));
-    if (verified) return verified;
-    // Fall through to Basic Auth so the owner can recover from a stale Telegram
-    // WebView session or a token that has not yet been rotated in BotHost.
+  const id = String(req.headers['x-telegram-user-id'] || '').trim();
+  if (id) {
+    const user = db.prepare('SELECT * FROM telegram_users WHERE telegram_id=?').get(id);
+    if (user) return { id, role: user.role, user: { id } };
+    return { denied: true, user: { id } };
   }
-  const auth = req.headers.authorization || '';
-  const supplied = auth.startsWith('Basic ') ? Buffer.from(auth.slice(6), 'base64').toString() : '';
-  if (process.env.APP_PASSWORD && supplied === `tasks:${process.env.APP_PASSWORD}`) return { role: 'owner', id: '' };
   return null;
 }
 async function body(req) {
@@ -183,18 +161,36 @@ async function telegramCall(method, payload, timeout = 15000) {
 async function handleTelegramUpdate(update) {
   const message = update.message;
   if (!message?.chat || message.chat.type !== 'private' || !message.from) return;
+  const telegramId = String(message.from.id);
+  const approved = db.prepare('SELECT * FROM telegram_users WHERE telegram_id=?').get(telegramId);
   const command = String(message.text || '').trim().split(/\s+/, 1)[0].split('@')[0];
   if (command === '/start') {
+    if (!approved) {
+      await telegramCall('sendMessage', { chat_id: message.chat.id, text: 'Чтобы открыть alwtasks, отправьте пароль одним сообщением.' });
+      return;
+    }
     await telegramCall('sendMessage', {
       chat_id: message.chat.id,
       text: 'alwtasks — ваши задачи и прогресс. Откройте доску кнопкой ниже.',
-      reply_markup: { inline_keyboard: [[{ text: 'Открыть Ритм', web_app: { url: webAppUrl } }]] }
+      reply_markup: { inline_keyboard: [[{ text: 'Открыть alwtasks', web_app: { url: webAppUrl } }]] }
     });
+  } else if (!approved && message.text && !String(message.text).startsWith('/')) {
+    if (process.env.APP_PASSWORD && String(message.text).trim() === process.env.APP_PASSWORD) {
+      const role = ownerId ? (telegramId === ownerId ? 'owner' : 'manager') : 'owner';
+      db.prepare('INSERT INTO telegram_users(telegram_id,role,approved_at) VALUES(?,?,?) ON CONFLICT(telegram_id) DO UPDATE SET role=excluded.role,approved_at=excluded.approved_at').run(telegramId, role, stamp());
+      await telegramCall('sendMessage', { chat_id: message.chat.id, text: 'Готово. Доступ к alwtasks открыт.', reply_markup: { inline_keyboard: [[{ text: 'Открыть alwtasks', web_app: { url: webAppUrl } }]] } });
+    } else {
+      await telegramCall('sendMessage', { chat_id: message.chat.id, text: 'Пароль не подошёл. Отправьте пароль ещё раз или /start.' });
+    }
+    return;
   } else if (command === '/id') {
+    if (!approved) return telegramCall('sendMessage', { chat_id: message.chat.id, text: 'Сначала отправьте /start и пароль доступа.' });
     await telegramCall('sendMessage', { chat_id: message.chat.id, text: `Ваш Telegram ID: ${message.from.id}` });
   } else if (command === '/help') {
+    if (!approved) return telegramCall('sendMessage', { chat_id: message.chat.id, text: 'Сначала отправьте /start и пароль доступа.' });
     await telegramCall('sendMessage', { chat_id: message.chat.id, text: 'Команды:\n/start — открыть мини-приложение\n/id — показать ваш Telegram ID' });
   } else if (command === '/today') {
+    if (!approved) return telegramCall('sendMessage', { chat_id: message.chat.id, text: 'Сначала отправьте /start и пароль доступа.' });
     const today = new Date().toISOString().slice(0, 10);
     const dueTasks = taskViews(db.prepare(`SELECT * FROM tasks WHERE archived=0 AND status!='Готово' AND due_date=? ORDER BY priority DESC, updated_at DESC`).all(today));
     const text = dueTasks.length ? `Задачи на сегодня:\n\n${dueTasks.map(task => `• ${task.title} — ${task.status}`).join('\n')}` : 'На сегодня задач нет.';
@@ -205,12 +201,12 @@ async function startTelegramBot() {
   if (!botToken) { console.warn('Telegram bot token is missing; Mini App launcher is disabled.'); return; }
   try {
     await telegramCall('setMyCommands', { commands: [
-      { command: 'start', description: 'Открыть Ритм' },
+      { command: 'start', description: 'Открыть alwtasks' },
       { command: 'id', description: 'Показать мой Telegram ID' },
       { command: 'help', description: 'Помощь' },
       { command: 'today', description: 'Задачи на сегодня' }
     ] });
-    await telegramCall('setChatMenuButton', { menu_button: { type: 'web_app', text: 'Открыть Ритм', web_app: { url: webAppUrl } } });
+    await telegramCall('setChatMenuButton', { menu_button: { type: 'web_app', text: 'Открыть alwtasks', web_app: { url: webAppUrl } } });
     console.log('Telegram Mini App menu button configured.');
   } catch (error) { console.warn(`Could not configure Telegram Mini App menu button: ${error.message}`); }
   let offset = 0;
@@ -300,8 +296,9 @@ const server = http.createServer(async (req, res) => {
       const taskId = Number(url.pathname.split('/')[3]);
       const patch = await body(req); const title = String(patch.title || '').trim();
       if (!title) return json(res, 400, { error: 'Название шага не может быть пустым' });
+      const stepStatus = ['Следующий','В работе','Жду ответа','Проблема','Готово'].includes(patch.step_status) ? patch.step_status : 'Следующий';
       const now = stamp(); const position = Number(db.prepare('SELECT COALESCE(MAX(position),-1)+1 AS next FROM task_steps WHERE task_id=?').get(taskId).next);
-      const result = db.prepare('INSERT INTO task_steps(task_id,title,done,position,created_at,updated_at) VALUES(?,?,?,?,?,?)').run(taskId, title.slice(0, 240), 0, position, now, now);
+      const result = db.prepare('INSERT INTO task_steps(task_id,title,done,step_status,position,created_at,updated_at) VALUES(?,?,?,?,?,?,?)').run(taskId, title.slice(0, 240), stepStatus === 'Готово' ? 1 : 0, stepStatus, position, now, now);
       logEvent(taskId, `Добавлен шаг: ${title.slice(0, 90)}`);
       return json(res, 201, db.prepare('SELECT * FROM task_steps WHERE id=?').get(Number(result.lastInsertRowid)));
     }
@@ -309,9 +306,10 @@ const server = http.createServer(async (req, res) => {
       const id = Number(url.pathname.split('/').at(-1)); const old = db.prepare('SELECT * FROM task_steps WHERE id=?').get(id);
       if (!old) return json(res, 404, { error: 'Шаг не найден' });
       const patch = await body(req); const title = patch.title === undefined ? old.title : String(patch.title).trim();
-      const done = patch.done === undefined ? old.done : (patch.done ? 1 : 0); const now = stamp();
-      db.prepare('UPDATE task_steps SET title=?,done=?,position=?,updated_at=? WHERE id=?').run(title.slice(0, 240), done, Number(patch.position ?? old.position), now, id);
-      logEvent(old.task_id, `${done ? 'Выполнен' : 'Открыт'} шаг: ${title.slice(0, 90)}`);
+      const status = patch.step_status === undefined ? (patch.done === undefined ? (old.step_status || (old.done ? 'Готово' : 'Следующий')) : (patch.done ? 'Готово' : 'В работе')) : (['Следующий','В работе','Жду ответа','Проблема','Готово'].includes(patch.step_status) ? patch.step_status : 'Следующий');
+      const done = status === 'Готово' ? 1 : 0; const now = stamp();
+      db.prepare('UPDATE task_steps SET title=?,done=?,step_status=?,position=?,updated_at=? WHERE id=?').run(title.slice(0, 240), done, status, Number(patch.position ?? old.position), now, id);
+      logEvent(old.task_id, `Шаг «${title.slice(0, 70)}»: ${status}`);
       const task = selectTask.get(old.task_id); const delivered = await notify(task, done ? 'Шаг выполнен' : 'Шаг снова открыт');
       return json(res, 200, { ...db.prepare('SELECT * FROM task_steps WHERE id=?').get(id), notification: delivered });
     }
