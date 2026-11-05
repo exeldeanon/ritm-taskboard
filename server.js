@@ -76,6 +76,17 @@ CREATE TABLE IF NOT EXISTS telegram_pending (
 CREATE TABLE IF NOT EXISTS app_settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS task_statuses (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE,
+  category TEXT NOT NULL DEFAULT 'active',
+  color TEXT NOT NULL DEFAULT '#1367de',
+  icon TEXT NOT NULL DEFAULT '•',
+  position INTEGER NOT NULL DEFAULT 0,
+  is_done INTEGER NOT NULL DEFAULT 0,
+  is_system INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
 );`);
 
 function ensureColumn(table, column, definition) {
@@ -100,7 +111,20 @@ ensureColumn('task_steps', 'note', "TEXT NOT NULL DEFAULT ''");
 ensureColumn('task_steps', 'url', "TEXT NOT NULL DEFAULT ''");
 ensureColumn('events', 'actor', "TEXT NOT NULL DEFAULT 'Система'");
 
-const statuses = ['Входящие', 'Запланировано', 'В работе', 'Жду ответа', 'Готово'];
+const defaultStatusDefinitions = [
+  ['Входящие', 'incoming', '#9db8df', '↘', 0, 0],
+  ['Запланировано', 'planned', '#8b7dc7', '◫', 1, 0],
+  ['В работе', 'active', '#1367de', '◷', 2, 0],
+  ['Жду ответа', 'waiting', '#bd9555', '↗', 3, 0],
+  ['Готово', 'done', '#619677', '✓', 4, 1]
+];
+for (const [name, category, color, icon, position, isDone] of defaultStatusDefinitions) db.prepare('INSERT OR IGNORE INTO task_statuses(name,category,color,icon,position,is_done,is_system,created_at) VALUES(?,?,?,?,?,?,1,?)').run(name, category, color, icon, position, isDone, new Date().toISOString());
+db.prepare("UPDATE task_statuses SET is_done=CASE WHEN name='Готово' THEN 1 ELSE 0 END WHERE is_system=1").run();
+function getStatuses() { return db.prepare('SELECT * FROM task_statuses ORDER BY position,id').all(); }
+function statusNames() { return getStatuses().map(status => status.name); }
+function statusInfo(name) { return getStatuses().find(status => status.name === name) || getStatuses()[0]; }
+function isDoneStatus(name) { return Boolean(statusInfo(name)?.is_done); }
+function statusForCategory(category, fallback) { return getStatuses().find(status => status.category === category) || statusInfo(fallback) || getStatuses()[0]; }
 const priorities = ['Низкий', 'Обычный', 'Высокий', 'Срочный'];
 const botToken = process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN || '';
 const webAppUrl = process.env.WEBAPP_URL || 'https://bot-1793823483-4147-exel.bothost.tech/';
@@ -108,7 +132,7 @@ const ownerId = process.env.OWNER_TELEGRAM_ID || '';
 const managerId = process.env.MANAGER_CHAT_ID || '';
 const ownerPassword = process.env.OWNER_PASSWORD || process.env.APP_PASSWORD || '';
 const managerPassword = process.env.MANAGER_PASSWORD || process.env.APP_PASSWORD || '';
-const buildVersion = 'all-features-20261105';
+const buildVersion = 'custom-statuses-20261105';
 const digestHour = Math.max(0, Math.min(23, Number(process.env.DAILY_DIGEST_HOUR || 18)));
 const launchUrl = (() => { try { const parsed = new URL(webAppUrl); parsed.searchParams.set('v', buildVersion); return parsed.toString(); } catch { return webAppUrl; } })();
 const stamp = () => new Date().toISOString();
@@ -132,9 +156,25 @@ const json = (res, status, value) => { res.writeHead(status, { 'content-type': '
 function authenticate(req) {
   const id = String(req.headers['x-telegram-user-id'] || '').trim();
   if (id) {
-    const user = db.prepare('SELECT * FROM telegram_users WHERE telegram_id=?').get(id);
+    let user = db.prepare('SELECT * FROM telegram_users WHERE telegram_id=?').get(id);
+    if (!user && ownerId && id === String(ownerId)) {
+      db.prepare('INSERT INTO telegram_users(telegram_id,role,approved_at) VALUES(?,?,?) ON CONFLICT(telegram_id) DO UPDATE SET role=excluded.role,approved_at=excluded.approved_at').run(id, 'owner', stamp());
+      user = { telegram_id: id, role: 'owner' };
+    } else if (!user && managerId && id === String(managerId)) {
+      db.prepare('INSERT INTO telegram_users(telegram_id,role,approved_at) VALUES(?,?,?) ON CONFLICT(telegram_id) DO UPDATE SET role=excluded.role,approved_at=excluded.approved_at').run(id, 'manager', stamp());
+      user = { telegram_id: id, role: 'manager' };
+    }
     if (user) return { id, role: user.role, user: { id } };
     return { denied: true, user: { id } };
+  }
+  const authorization = String(req.headers.authorization || '');
+  if (authorization.startsWith('Basic ')) {
+    try {
+      const decoded = Buffer.from(authorization.slice(6), 'base64').toString('utf8');
+      const password = decoded.slice(decoded.indexOf(':') + 1);
+      if (ownerPassword && password === ownerPassword) return { role: 'owner', user: { first_name: 'Менеджер' } };
+      if (managerPassword && password === managerPassword) return { role: 'manager', user: { first_name: 'Начальство' } };
+    } catch {}
   }
   return null;
 }
@@ -177,7 +217,7 @@ async function notify(task, action, context = {}) {
 async function sendDueReminders() {
   if (!botToken || !managerId) return;
   const now = stamp();
-  const dueTasks = db.prepare(`SELECT * FROM tasks WHERE archived=0 AND status!='Готово' AND reminder_at!='' AND reminder_at<=? AND reminder_sent_at='' ORDER BY reminder_at LIMIT 20`).all(now);
+  const dueTasks = db.prepare(`SELECT * FROM tasks WHERE archived=0 AND status NOT IN (SELECT name FROM task_statuses WHERE is_done=1) AND reminder_at!='' AND reminder_at<=? AND reminder_sent_at='' ORDER BY reminder_at LIMIT 20`).all(now);
   for (const task of dueTasks) {
     const delivered = await notify(task, 'Напоминание');
     if (delivered) {
@@ -257,7 +297,7 @@ async function handleTelegramUpdate(update) {
   } else if (command === '/today') {
     if (!approved) return telegramCall('sendMessage', { chat_id: message.chat.id, text: 'Сначала отправьте /start и пароль доступа.' });
     const today = new Date().toISOString().slice(0, 10);
-    const dueTasks = taskViews(db.prepare(`SELECT * FROM tasks WHERE archived=0 AND status!='Готово' AND due_date=? ORDER BY priority DESC, updated_at DESC`).all(today));
+    const dueTasks = taskViews(db.prepare(`SELECT * FROM tasks WHERE archived=0 AND status NOT IN (SELECT name FROM task_statuses WHERE is_done=1) AND due_date=? ORDER BY priority DESC, updated_at DESC`).all(today));
     const text = dueTasks.length ? `Задачи на сегодня:\n\n${dueTasks.map(task => `• ${task.title} — ${task.status}`).join('\n')}` : 'На сегодня задач нет.';
     await telegramCall('sendMessage', { chat_id: message.chat.id, text });
   }
@@ -301,14 +341,19 @@ function syncTaskStatus(taskId) {
   if (!task) return null;
   const steps = db.prepare('SELECT * FROM task_steps WHERE task_id=? ORDER BY position,id').all(taskId);
   if (!steps.length) return null;
+  const doneStatus = statusForCategory('done', 'Готово');
+  const waitingStatus = statusForCategory('waiting', 'Жду ответа');
+  const activeStatus = statusForCategory('active', 'В работе');
+  const plannedStatus = statusForCategory('planned', 'Запланировано');
   const allDone = steps.every(step => step.step_status === 'Готово' || step.done);
   const hasProblem = steps.some(step => step.step_status === 'Проблема');
   const hasWaiting = steps.some(step => step.step_status === 'Жду ответа');
   const hasWork = steps.some(step => step.step_status === 'В работе');
-  const nextStatus = allDone ? 'Готово' : hasProblem || hasWaiting ? 'Жду ответа' : hasWork ? 'В работе' : 'Запланировано';
+  const blockedStatus = statusForCategory('blocked', waitingStatus.name);
+  const nextStatus = allDone ? doneStatus.name : hasProblem ? blockedStatus.name : hasWaiting ? waitingStatus.name : hasWork ? activeStatus.name : plannedStatus.name;
   if (nextStatus === task.status) return null;
   const now = stamp();
-  db.prepare('UPDATE tasks SET status=?,completed_at=?,updated_at=? WHERE id=?').run(nextStatus, nextStatus === 'Готово' ? (task.completed_at || now) : '', now, taskId);
+  db.prepare('UPDATE tasks SET status=?,completed_at=?,updated_at=? WHERE id=?').run(nextStatus, isDoneStatus(nextStatus) ? (task.completed_at || now) : '', now, taskId);
   logEvent(taskId, `Автостатус по шагам: ${task.status} → ${nextStatus}`);
   return { before: task.status, after: nextStatus };
 }
@@ -322,7 +367,7 @@ async function sendDailyDigest(force = false, targetChat = managerId) {
   if (!botToken || !targetChat) return false;
   const now = moscowNow();
   if (!force && (now.hour < digestHour || appSetting('daily_digest_date') === now.date)) return false;
-  const active = db.prepare("SELECT * FROM tasks WHERE archived=0 AND status!='Готово' ORDER BY CASE WHEN due_date='' THEN 1 ELSE 0 END,due_date,priority DESC,updated_at DESC").all();
+  const active = db.prepare("SELECT * FROM tasks WHERE archived=0 AND status NOT IN (SELECT name FROM task_statuses WHERE is_done=1) ORDER BY CASE WHEN due_date='' THEN 1 ELSE 0 END,due_date,priority DESC,updated_at DESC").all();
   const overdue = active.filter(task => task.due_date && task.due_date < now.date);
   const today = active.filter(task => task.due_date === now.date);
   const waiting = active.filter(task => task.status === 'Жду ответа' || db.prepare("SELECT 1 FROM task_steps WHERE task_id=? AND step_status IN ('Жду ответа','Проблема') LIMIT 1").get(task.id));
@@ -372,12 +417,55 @@ const server = http.createServer(async (req, res) => {
       const status = String(url.searchParams.get('status') || '').trim();
       const priority = String(url.searchParams.get('priority') || '').trim();
       const tag = String(url.searchParams.get('tag') || '').trim().replace(/^#/, '').toLowerCase();
-      const items = taskViews(db.prepare(`SELECT t.*,(SELECT message FROM events e WHERE e.task_id=t.id ORDER BY e.id DESC LIMIT 1) AS last_event,(SELECT COUNT(*) FROM task_steps s WHERE s.task_id=t.id) AS step_count,(SELECT COUNT(*) FROM task_steps s WHERE s.task_id=t.id AND s.done=1) AS completed_step_count,(SELECT COALESCE(json_group_array(json_object('id',s.id,'title',s.title,'done',s.done,'step_status',s.step_status,'due_date',s.due_date,'assignee',s.assignee,'note',s.note,'url',s.url,'position',s.position)), '[]') FROM (SELECT id,title,done,step_status,due_date,assignee,note,url,position FROM task_steps WHERE task_id=t.id ORDER BY position,id) s) AS steps_json,(SELECT title FROM tasks dep WHERE dep.id=t.depends_on_id) AS depends_on_title,(SELECT status FROM tasks dep WHERE dep.id=t.depends_on_id) AS depends_on_status FROM tasks t WHERE (?=1 OR t.archived=0) ORDER BY t.sort_order, CASE t.status WHEN 'Готово' THEN 1 ELSE 0 END, CASE t.priority WHEN 'Срочный' THEN 0 WHEN 'Высокий' THEN 1 WHEN 'Обычный' THEN 2 ELSE 3 END, CASE WHEN t.due_date='' THEN 1 ELSE 0 END,t.due_date,t.updated_at DESC`).all(includeArchived ? 1 : 0).filter(task => {
+      const items = taskViews(db.prepare(`SELECT t.*,(SELECT message FROM events e WHERE e.task_id=t.id ORDER BY e.id DESC LIMIT 1) AS last_event,(SELECT COUNT(*) FROM task_steps s WHERE s.task_id=t.id) AS step_count,(SELECT COUNT(*) FROM task_steps s WHERE s.task_id=t.id AND s.done=1) AS completed_step_count,(SELECT COALESCE(json_group_array(json_object('id',s.id,'title',s.title,'done',s.done,'step_status',s.step_status,'due_date',s.due_date,'assignee',s.assignee,'note',s.note,'url',s.url,'position',s.position)), '[]') FROM (SELECT id,title,done,step_status,due_date,assignee,note,url,position FROM task_steps WHERE task_id=t.id ORDER BY position,id) s) AS steps_json,(SELECT title FROM tasks dep WHERE dep.id=t.depends_on_id) AS depends_on_title,(SELECT status FROM tasks dep WHERE dep.id=t.depends_on_id) AS depends_on_status FROM tasks t WHERE (?=1 OR t.archived=0) ORDER BY t.sort_order, CASE WHEN t.status IN (SELECT name FROM task_statuses WHERE is_done=1) THEN 1 ELSE 0 END, CASE t.priority WHEN 'Срочный' THEN 0 WHEN 'Высокий' THEN 1 WHEN 'Обычный' THEN 2 ELSE 3 END, CASE WHEN t.due_date='' THEN 1 ELSE 0 END,t.due_date,t.updated_at DESC`).all(includeArchived ? 1 : 0).filter(task => {
         const tags = taskView(task).tags;
         const haystack = `${task.title} ${task.description} ${task.next_step} ${task.blocker} ${task.assignee} ${tags.join(' ')}`.toLowerCase();
         return (!query || haystack.includes(query)) && (!status || task.status === status) && (!priority || task.priority === priority) && (!tag || tags.some(item => item.toLowerCase() === tag));
       }));
       return json(res, 200, items);
+    }
+    if (req.method === 'GET' && url.pathname === '/api/statuses') return json(res, 200, getStatuses());
+    if (req.method === 'POST' && url.pathname === '/api/statuses') {
+      const patch = await body(req);
+      const name = String(patch.name || '').trim().slice(0, 60);
+      const categories = new Set(['incoming', 'planned', 'active', 'waiting', 'blocked', 'done']);
+      const category = categories.has(patch.category) ? patch.category : 'active';
+      const color = /^#[0-9a-fA-F]{6}$/.test(String(patch.color || '')) ? String(patch.color) : '#1367de';
+      const icon = String(patch.icon || '•').trim().slice(0, 4) || '•';
+      const position = Number.isFinite(Number(patch.position)) ? Math.max(0, Math.min(999, Number(patch.position))) : getStatuses().length;
+      const isDone = patch.is_done ? 1 : 0;
+      if (!name) return json(res, 400, { error: 'Название статуса не может быть пустым' });
+      if (db.prepare('SELECT id FROM task_statuses WHERE name=?').get(name)) return json(res, 400, { error: 'Такой статус уже существует' });
+      const result = db.prepare('INSERT INTO task_statuses(name,category,color,icon,position,is_done,is_system,created_at) VALUES(?,?,?,?,?,?,0,?)').run(name, category, color, icon, position, isDone, stamp());
+      return json(res, 201, db.prepare('SELECT * FROM task_statuses WHERE id=?').get(Number(result.lastInsertRowid)));
+    }
+    if (req.method === 'PATCH' && /^\/api\/statuses\/\d+$/.test(url.pathname)) {
+      const id = Number(url.pathname.split('/').at(-1));
+      const old = db.prepare('SELECT * FROM task_statuses WHERE id=?').get(id);
+      if (!old) return json(res, 404, { error: 'Статус не найден' });
+      const patch = await body(req);
+      const name = patch.name === undefined ? old.name : String(patch.name || '').trim().slice(0, 60);
+      const categories = new Set(['incoming', 'planned', 'active', 'waiting', 'blocked', 'done']);
+      const category = patch.category === undefined ? old.category : (categories.has(patch.category) ? patch.category : old.category);
+      const color = patch.color === undefined ? old.color : (/^#[0-9a-fA-F]{6}$/.test(String(patch.color)) ? String(patch.color) : old.color);
+      const icon = patch.icon === undefined ? old.icon : (String(patch.icon || '•').trim().slice(0, 4) || '•');
+      const position = patch.position === undefined ? old.position : Math.max(0, Math.min(999, Number(patch.position) || 0));
+      const isDone = patch.is_done === undefined ? old.is_done : (patch.is_done ? 1 : 0);
+      if (!name) return json(res, 400, { error: 'Название статуса не может быть пустым' });
+      const duplicate = db.prepare('SELECT id FROM task_statuses WHERE name=? AND id!=?').get(name, id);
+      if (duplicate) return json(res, 400, { error: 'Такой статус уже существует' });
+      db.prepare('UPDATE task_statuses SET name=?,category=?,color=?,icon=?,position=?,is_done=? WHERE id=?').run(name, category, color, icon, position, isDone, id);
+      if (name !== old.name) db.prepare('UPDATE tasks SET status=?,updated_at=? WHERE status=?').run(name, stamp(), old.name);
+      return json(res, 200, db.prepare('SELECT * FROM task_statuses WHERE id=?').get(id));
+    }
+    if (req.method === 'DELETE' && /^\/api\/statuses\/\d+$/.test(url.pathname)) {
+      const id = Number(url.pathname.split('/').at(-1));
+      const status = db.prepare('SELECT * FROM task_statuses WHERE id=?').get(id);
+      if (!status) return json(res, 404, { error: 'Статус не найден' });
+      if (status.is_system) return json(res, 400, { error: 'Системный статус нельзя удалить' });
+      if (db.prepare('SELECT id FROM tasks WHERE status=? LIMIT 1').get(status.name)) return json(res, 400, { error: 'Сначала перенесите задачи на другой статус' });
+      db.prepare('DELETE FROM task_statuses WHERE id=?').run(id);
+      return json(res, 200, { ok: true });
     }
     if (req.method === 'GET' && url.pathname === '/api/templates') return json(res, 200, taskTemplates);
     if (req.method === 'GET' && url.pathname === '/api/export') {
@@ -468,7 +556,9 @@ const server = http.createServer(async (req, res) => {
       if (!isNew && !old) return json(res, 404, { error: 'Задача не найдена' });
       const title = String(patch.title ?? old?.title ?? '').trim();
       if (!title) return json(res, 400, { error: 'Укажите название задачи' });
-      const status = statuses.includes(patch.status) ? patch.status : (old?.status || 'Входящие');
+      const availableStatuses = statusNames();
+      const defaultStatus = availableStatuses[0] || 'Входящие';
+      const status = availableStatuses.includes(patch.status) ? patch.status : (old?.status || defaultStatus);
       const priority = priorities.includes(patch.priority) ? patch.priority : (old?.priority || 'Обычный');
       const tags = cleanTags(patch.tags ?? old?.tags);
       const assignee = String(patch.assignee ?? old?.assignee ?? '').trim().slice(0, 120);
@@ -480,7 +570,7 @@ const server = http.createServer(async (req, res) => {
       if (dependsOnId && ((!isNew && dependsOnId === id) || !db.prepare('SELECT id FROM tasks WHERE id=?').get(dependsOnId))) return json(res, 400, { error: 'Выберите существующую другую задачу для зависимости' });
       const archived = patch.archived === undefined ? Number(old?.archived || 0) : (patch.archived ? 1 : 0);
       const parentId = patch.parent_id === undefined ? (old?.parent_id || null) : (patch.parent_id ? Number(patch.parent_id) : null);
-      const completedAt = status === 'Готово' ? (old?.completed_at || stamp()) : '';
+      const completedAt = isDoneStatus(status) ? (old?.completed_at || stamp()) : '';
       const reminderSentAt = reminderAt !== String(old?.reminder_at || '') ? '' : String(old?.reminder_sent_at || '');
       const updatedAt = stamp();
       const values = [title, String(patch.description ?? old?.description ?? ''), status, priority, dueDate, String(patch.next_step ?? old?.next_step ?? ''), String(patch.blocker ?? old?.blocker ?? ''), JSON.stringify(tags), assignee, reminderAt, repeatRule, scheduledAt, dependsOnId, archived, completedAt, parentId, Number(patch.sort_order ?? old?.sort_order ?? 0), reminderSentAt, updatedAt];
@@ -510,7 +600,8 @@ const server = http.createServer(async (req, res) => {
       role: principal.role, canEdit: principal.role === 'owner',
       roleName: principal.role === 'owner' ? 'Менеджер' : 'Начальство',
       telegramEnabled: Boolean(botToken && managerId),
-      accessReady: Boolean(ownerId && managerId)
+      accessReady: Boolean(ownerId && managerId),
+      statuses: getStatuses()
     });
     json(res, 404, { error: 'Не найдено' });
   } catch (err) { json(res, 500, { error: err.message || 'Внутренняя ошибка' }); }
